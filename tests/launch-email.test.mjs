@@ -100,7 +100,11 @@ test("waitlist consent is not quietly widened into deal-mail consent", () => {
 test("the launch email is not on a schedule", () => {
   // Every other job in the folder is self-invoked hourly by the worker. This one is a single
   // irreversible broadcast; a cron entry would mean a deploy could fire it.
-  assert.ok(!/jobs\/launch-email/.test(worker), "the launch email has been wired into the cron");
+  // The Worker names every API route once, to answer an address no route has (API_ROUTES); the
+  // cron is what must not name this one.
+  const cron = worker.slice(worker.indexOf("async scheduled("));
+  assert.ok(cron.length > 1000, "expected the scheduled handler");
+  assert.ok(!/launch-email/.test(cron), "the launch email has been wired into the cron");
 });
 
 test("the message says why it arrived and how to stop it", () => {

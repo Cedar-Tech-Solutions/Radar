@@ -347,6 +347,111 @@ async function bakeCityPages(worker, env, failures, paths) {
   return baked;
 }
 
+// The not-found page, once per locale, at dist/client/__baked/404/<locale>.html.
+//
+// Every address under a locale that no route claims was a render of this page - header, footer
+// and flight data, 13-30 ms of CPU locally against the platform's ten - and a scanner or a broken
+// link asks for a different one each time. The Worker answers those from this file instead
+// (unknownAddress and missingPage in worker/index.ts), with the 404 status and the locale cookie the
+// render would have given them. Rendered here at an address no page can have, so the Worker, which
+// finds no baked file on this pass, lets the render through.
+const NOT_FOUND_DIR = path.join(CLIENT_DIR, "__baked", "404");
+
+async function bakeNotFoundPages(worker, env, failures) {
+  let baked = 0;
+  for (const locale of LOCALES) {
+    const pathname = `/${locale}/__not-a-page__/${Date.now()}`;
+    const response = await worker.fetch(
+      new Request(`${ORIGIN}${pathname}`, { headers: { host: "radar.cheap", accept: "text/html" } }),
+      env,
+      { waitUntil() {}, passThroughOnException() {} },
+    );
+    const html = await response.text();
+    if (response.status !== 404 || !html.includes("</html>") || !html.includes("<html")) {
+      failures.push(`not-found page for ${locale}: ${response.status}, ${html.length} bytes`);
+      continue;
+    }
+    mkdirSync(NOT_FOUND_DIR, { recursive: true });
+    writeFileSync(path.join(NOT_FOUND_DIR, `${locale}.html`), html, "utf8");
+    baked += 1;
+  }
+  return baked;
+}
+
+// Every shard of the deals snapshot, at dist/client/__baked/deals-snapshot/v<N>/<key>.json.
+//
+// A colo that holds no copy of a shard built it from D1 inside the first request that needed it:
+// fifty to two hundred milliseconds of CPU, on every cell, after every deploy that changed the
+// snapshot's format and in every colo traffic reached for the first time. The route now reads
+// these files last, after the colo's and R2's copies, and serves one while it rebuilds the current
+// revision behind the request (readBakedSnapshot and catchUp in app/api/deals/route.ts).
+//
+// Built the way a request builds them, through the Worker, with the Cache API stood in for by a
+// map: a request placed in each cell that holds a branch makes the route build that cell (and the
+// meta shard), one per country its country and nationwide shards, and what the route publishes
+// under the fixed "latest" name is what is written. The keys and the format are the route's own;
+// this script knows neither, which is the point.
+const SNAPSHOT_DIR = path.join(CLIENT_DIR, "__baked", "deals-snapshot");
+
+async function bakeSnapshotShards(worker, env, db, failures) {
+  const captured = new Map();
+  const pending = [];
+  let cells = [];
+  const countries = new Set();
+  const key = (request) => (typeof request === "string" ? request : request.url);
+  globalThis.caches = {
+    default: {
+      match: async () => undefined,
+      delete: async () => false,
+      put: async (request, response) => {
+        const url = key(request);
+        const match = /\/__deals-snapshot\/(v\d+)\/latest\/([^/]+)$/.exec(url);
+        if (!match) return;
+        const read = response.text().then((body) => { captured.set(`${match[1]}/${match[2]}`, body); });
+        pending.push(read);
+        await read;
+      },
+    },
+  };
+  try {
+    cells = db.prepare(
+      "SELECT DISTINCT CAST(floor(latitude) AS INTEGER) lat, CAST(floor(longitude) AS INTEGER) lng FROM restaurant_locations WHERE latitude IS NOT NULL AND longitude IS NOT NULL",
+    ).all();
+    for (const row of db.prepare("SELECT DISTINCT UPPER(country) country FROM restaurants WHERE country IS NOT NULL UNION SELECT DISTINCT UPPER(country) FROM restaurant_locations WHERE country IS NOT NULL").all()) {
+      if (/^[A-Z]{2}$/.test(row.country || "")) countries.add(row.country);
+    }
+    const requests = [
+      ...cells.map((cell) => `/api/deals?lat=${cell.lat + 0.5}&lng=${cell.lng + 0.5}&radius=1&limit=1&tz=UTC`),
+      ...[...countries].flatMap((country) => [`/api/deals?country=${country}&limit=1`, `/api/deals?scope=national&country=${country}&limit=1`]),
+    ];
+    for (const pathname of requests) {
+      const response = await worker.fetch(
+        new Request(`${ORIGIN}${pathname}`, { headers: { host: "radar.cheap", accept: "application/json" } }),
+        env,
+        { waitUntil(promise) { pending.push(Promise.resolve(promise).catch(() => {})); }, passThroughOnException() {} },
+      );
+      await response.body?.cancel();
+      if (response.status !== 200) failures.push(`snapshot shard request ${pathname}: ${response.status}`);
+    }
+    // Whatever the route scheduled behind those requests, including the publishes themselves.
+    for (let round = 0; round < 5 && pending.length; round++) {
+      const batch = pending.splice(0);
+      await Promise.all(batch);
+    }
+  } finally {
+    delete globalThis.caches;
+  }
+  if (!captured.has([...captured.keys()].find((name) => name.endsWith("/meta")) || "")) failures.push("the snapshot's meta shard was not built");
+  for (const [name, body] of captured) {
+    // "cell:43:-80" is written as cell_43_-80.json: a colon cannot be in a file name on Windows,
+    // where this script also runs. The route asks for the same spelling (bakedSnapshotPath).
+    const outPath = path.join(SNAPSHOT_DIR, `${name.replace(/:/g, "_")}.json`);
+    mkdirSync(path.dirname(outPath), { recursive: true });
+    writeFileSync(outPath, body, "utf8");
+  }
+  return { shards: captured.size, cells: cells.length, countries: countries.size };
+}
+
 // One share card per deal in the sitemap, at dist/client/og/deals/<slug>.png (scripts/deal-og.mjs).
 // The deal page's og:image names that address, and a deal without a file there gets /og.png from the
 // Worker, so a card that cannot be drawn costs one preview its picture, not the deploy - up to a
@@ -427,6 +532,10 @@ async function main() {
     const cityPaths = cityPathsFromSitemap(crawlerFiles["sitemap.xml"]);
     const cityPages = await bakeCityPages(worker, env, failures, cityPaths);
     log(`prerendered ${cityPages} of ${cityPaths.length} city guide pages`);
+    const notFoundPages = await bakeNotFoundPages(worker, env, failures);
+    log(`prerendered ${notFoundPages} of ${LOCALES.length} not-found pages`);
+    const shards = await bakeSnapshotShards(worker, env, db, failures);
+    log(`baked ${shards.shards} snapshot shards (${shards.cells} cells, ${shards.countries} countries)`);
     const slugs = dealSlugsFromSitemap(crawlerFiles["sitemap.xml"]);
     log(`${slugs.length} deals x ${LOCALES.length} locales to prerender`);
 

@@ -173,3 +173,33 @@ test("a baked page costs next to nothing, for a signed-in reader too", async () 
   assert.match(marked.body, /^<!doctype html><html data-signed-in="" lang="en">/);
   within("the baked home page, marked for a signed-in reader", marked, 6);
 });
+
+// A fresh isolate's first request paid 7-9 ms before any work of its own - the framework's router
+// and request machinery compiled and run for the first time - and the platform starts a fresh
+// isolate for a burst of traffic, after a deploy and whenever it moves the Worker. The bundle now
+// makes one request through the framework at startup (`warmed` in worker/index.ts), under the
+// startup allowance rather than a visitor's. Each isolate here is a fresh import of the bundle,
+// its warm-up awaited the way the runtime would have it settle before the first request arrives,
+// and the first request's CPU is what is measured: 1.5 ms after the warm-up, 8.8 without it.
+test("a fresh isolate's first request is not the one that pays for the framework", async () => {
+  const runs = [];
+  for (let i = 0; i < 5; i++) {
+    const url = new URL("../dist/server/index.js", import.meta.url);
+    url.searchParams.set("isolate", `${process.pid}-${Date.now()}-${i}`);
+    const fresh = await import(url.href);
+    await fresh.warmed;
+    await settle();
+    for (const key of [...cache.keys()]) if (key.includes("/__deals-answer/")) cache.delete(key);
+    sqlMs = 0;
+    const before = process.cpuUsage();
+    const response = await fresh.default.fetch(new Request(`https://radar.cheap/api/deals/${slug}`, { headers: { host: "radar.cheap", accept: "application/json" } }), globalThis.__BUDGET_ENV__, { waitUntil(promise) { globalThis.__BUDGET_WAITS__.push(Promise.resolve(promise).catch(() => {})); }, passThroughOnException() {} });
+    const body = await response.text();
+    const used = process.cpuUsage(before);
+    assert.equal(response.status, 200, body.slice(0, 200));
+    runs.push((used.user + used.system) / 1000 - sqlMs);
+    await settle();
+  }
+  // 3-6 ms here when the ceiling was set (the route's own chunk is still compiled on its first
+  // request); 8-9 without the warm-up.
+  within("a fresh isolate's first request, a deal by slug", { ms: Math.min(...runs), runs }, 7);
+});

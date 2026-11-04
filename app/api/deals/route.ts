@@ -1040,6 +1040,58 @@ async function readGlobalSnapshot(origin: string, key: string, revision: string 
   }
 }
 
+// The copy of every shard the deploy baked (scripts/prerender-deals.mjs), under dist/client, read
+// through the asset binding: a file, present in every colo from the moment of deploy, at the
+// revision the deploy saw.
+//
+// It is what a cold colo had nothing of. The colo's own copy is built by a request and R2's by the
+// first colo to build a revision, so after a deploy that bumped SNAPSHOT_CACHE_VERSION, or in a colo
+// no request has reached since, the first reader of every shard built it from D1 inside their own
+// request - fifty to two hundred milliseconds of CPU against an allowance of ten (docs/CPU-BUDGET.md).
+// Read last, after the colo's and R2's copies, and knowingly stale: the current revision is built
+// behind the request that took it (catchUp).
+//
+// Under /__baked/, which wrangler.jsonc routes to the Worker first and the Worker refuses to serve
+// (INTERNAL_CACHE_PATH in worker/index.ts): the files are reachable from here and from nowhere else.
+// "cell:43:-80" is the file cell_43_-80.json: the prerender writes the shards on Windows too, where
+// a colon cannot be in a file name (bakeSnapshotShards in scripts/prerender-deals.mjs).
+const bakedSnapshotPath = (key: string) => `/__baked/deals-snapshot/v${SNAPSHOT_CACHE_VERSION}/${key.replace(/:/g, "_")}.json`;
+
+function snapshotAssets(): Fetcher | null {
+  try {
+    return (env as { ASSETS?: Fetcher }).ASSETS ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function readBakedSnapshot(origin: string, key: string): Promise<Stored | null> {
+  const assets = snapshotAssets();
+  if (!assets) return null;
+  try {
+    const file = await assets.fetch(new Request(`${origin}${bakedSnapshotPath(key)}`, { method: "GET" }));
+    if (file.status !== 200) {
+      await file.body?.cancel();
+      return null;
+    }
+    const serialized = await file.text();
+    const stored = deserializeSnapshot(JSON.parse(serialized), key);
+    if (!stored) return null;
+    // Into the colo as well, under its own revision and the fixed name, so the isolates beside this
+    // one find it there and nobody builds it twice.
+    const publish = publishToColo(origin, key, stored.revision, serialized);
+    try {
+      waitUntil(publish);
+    } catch {
+      // No request context; the puts are already running.
+    }
+    return stored;
+  } catch {
+    // A missing or torn file is a miss, never an error the visitor sees.
+    return null;
+  }
+}
+
 // Which shards a request is about.
 
 // A 1-degree grid: at the latitudes Radar covers a cell is 70-111 km across, so a 50 km radius is
@@ -1521,7 +1573,7 @@ function catchUp(cacheOrigin: string, key: string): Promise<Stored> {
     if (revision) {
       knownRevision = revision;
       revisionCheckedAt = Date.now();
-      // This colo's copy first, then the one another colo built, and D1 only when neither has it.
+      // This colo's copy first, then the one another colo built.
       for (const read of [() => readSharedSnapshot(cacheOrigin, key, revision), () => readGlobalSnapshot(cacheOrigin, key, revision)]) {
         const shared = await read();
         if (shared && shared.expiresAt > Date.now()) {
@@ -1529,18 +1581,37 @@ function catchUp(cacheOrigin: string, key: string): Promise<Stored> {
           return shared;
         }
       }
-      return refreshSnapshot(cacheOrigin, key);
     }
-    // D1 may be refusing reads, which is when this path matters most. A revision we cannot learn
-    // falls back to the copy published under the fixed name, then to whatever R2 holds — knowingly
-    // stale, and far better than the 500 a cold isolate used to return during an outage.
-    const fallback = (await readFallbackSnapshot(cacheOrigin, key)) ?? (await readGlobalSnapshot(cacheOrigin, key, null));
-    if (!fallback) return refreshSnapshot(cacheOrigin, key);
-    hold(fallback);
-    return fallback;
+    // Nobody has built this revision yet, or the revision could not be learned - D1 may be refusing
+    // reads, which is when this path matters most. Any copy there is answers this request: the one
+    // published under the fixed name in this colo, then whatever R2 holds, then the file the deploy
+    // baked. Knowingly stale, by at most the time since the last write, and the current revision is
+    // built behind the request rather than inside it.
+    //
+    // It used to be built inside it: a revision nobody had built yet went straight to D1, so the
+    // first reader of every shard after every staff edit - and every reader in a colo that had
+    // nothing - paid the whole build, fifty to two hundred milliseconds of CPU on an allowance of
+    // ten. A visitor is owed deals, not the freshest possible deals, and the difference is bounded
+    // by the rebuild landing seconds later; D1 is read inside a request only when there is no copy
+    // of a shard anywhere, which a deploy's baked files make the exception.
+    const stale = (await readFallbackSnapshot(cacheOrigin, key)) ?? (await readGlobalSnapshot(cacheOrigin, key, null)) ?? (await readBakedSnapshot(cacheOrigin, key));
+    if (!stale) return refreshSnapshot(cacheOrigin, key);
+    hold(stale);
+    if (revision && stale.revision !== revision) refreshBehind(cacheOrigin, key);
+    return stale;
   })().finally(() => { if (catchUpsInFlight.get(key)?.promise === attempt) catchUpsInFlight.delete(key); });
   catchUpsInFlight.set(key, { promise: attempt, startedAt: Date.now() });
   return attempt;
+}
+
+/** The current revision of `key` built from D1 behind the request, never awaited by it. */
+function refreshBehind(cacheOrigin: string, key: string) {
+  const build = refreshSnapshot(cacheOrigin, key).catch(() => {});
+  try {
+    waitUntil(build);
+  } catch {
+    // No request context to hang it on; the build is running either way.
+  }
 }
 
 /**
@@ -2088,7 +2159,18 @@ export async function GET(request: Request) {
   // Reach is at least the default radius, because the market-coverage verdict below is measured
   // over that much whatever the reader narrowed to.
   const reachKm = Math.max(radius, COVERAGE_REACH_KM);
-  const requestedShardCountry = shardCountry(requestedCountry);
+  // A browse that names no place and no country - the home page's first paint for a reader who
+  // has not shared a location and whose market it could not guess - used to read every country's
+  // shard, the whole catalogue, for a list that then showed two currencies at once. It is placed in
+  // the country the network puts the reader in instead, the way a bare point near the border is,
+  // and only a network Cloudflare cannot place (or one outside the catalogue's countries) still
+  // reads them all. A named state or province keeps the old reading: its country is not named, and
+  // guessing it from the network would empty a Texan's list on a Canadian connection. The network's
+  // answer is part of the question such an answer is shared under (sharedAnswerKey).
+  const browseCountry = !requestedCountry && !requestedProvince && !devicePoint && !postal && !requestedCity && meta.countries.includes(shardCountry(network.country) || "")
+    ? shardCountry(network.country)
+    : null;
+  const requestedShardCountry = shardCountry(requestedCountry) || browseCountry;
   const countryKeys = (country: string | null) => (country ? [country] : meta.countries).map(countryKey);
   let shards: DealsShard[];
   if (ids.size) {

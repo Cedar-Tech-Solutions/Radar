@@ -257,6 +257,23 @@ async function seedKey(cache) {
 }
 
 /**
+ * The revision-named key of the country shard, with every other copy of that shard gone, so what
+ * a test plants under it is the only copy an isolate can find.
+ *
+ * A build leaves the shard under the revision's name and under the fixed name a cold isolate
+ * reads without asking D1. A copy under the revision's name that an isolate refuses is answered
+ * from the fixed-name copy, built behind the request (the stale-copy tests below); a test about
+ * the refusal itself removes that copy first, or the refusal costs no rebuild to count.
+ */
+async function onlyRevisionCopy(cache) {
+  const key = await seedKey(cache);
+  for (const other of [...cache.store.keys()]) {
+    if (other !== key && other.endsWith(`/${COUNTRY_SHARD}`)) cache.store.delete(other);
+  }
+  return key;
+}
+
+/**
  * The revision-named keys the cache is holding, by shard.
  *
  * A build publishes two entries per shard: one named for the data revision, which a healthy read
@@ -417,7 +434,7 @@ test("an entry from another version is ignored", async () => {
     // Written at the key the route really publishes under, not one assembled here. Put anywhere
     // else it would simply be a miss, and the test would pass without exercising the validation.
     cache.store.set(
-      await seedKey(cache),
+      await onlyRevisionCopy(cache),
       new Response(JSON.stringify({ v: 999, key: COUNTRY_SHARD, expiresAt: Date.now() + 60_000, revision: "", sites: [], bases: [DEAL], translations: [] })),
     );
     const fresh = await isolate();
@@ -429,7 +446,7 @@ test("an entry from another version is ignored", async () => {
 test("a truncated entry is ignored rather than thrown", async () => {
   const cache = fakeCache();
   await withCache(cache, async () => {
-    cache.store.set(await seedKey(cache), new Response('{"v":1,"bases":[{"id":'));
+    cache.store.set(await onlyRevisionCopy(cache), new Response('{"v":1,"bases":[{"id":'));
     const fresh = await isolate();
     const response = await fresh.call();
     assert.equal(response.status, 200, "a torn entry is a miss, never an error the visitor sees");
@@ -464,12 +481,84 @@ test("a copy that names another shard is ignored", async () => {
   const cache = fakeCache();
   await withCache(cache, async () => {
     cache.store.set(
-      await seedKey(cache),
+      await onlyRevisionCopy(cache),
       new Response(JSON.stringify({ v: SNAPSHOT_VERSION, key: "country:US", expiresAt: Date.now() + 60_000, revision: "", sites: [], bases: [], translations: [] })),
     );
     const fresh = await isolate();
     assert.equal((await fresh.call()).status, 200);
     assert.ok(fresh.db.snapshotQueries > 0, "a copy of another shard must be rebuilt, not adopted");
+  });
+});
+
+// A shard the isolate has no good copy of under the current revision is no longer built while the
+// visitor waits: that build - every deal in the country read, measured and grouped - was the
+// request that ran past the free plan's ten milliseconds whenever a staff edit moved the revision
+// or a colo's cache had just been cleared. The colo's last good copy is served instead, and the
+// current one is built behind the request.
+test("a torn copy of the current revision is answered from the colo's last good copy, without waiting on D1", async () => {
+  const cache = fakeCache();
+  await withCache(cache, async () => {
+    cache.store.set(await seedKey(cache), new Response('{"v":1,"bases":[{"id":'));
+    const fresh = await isolate();
+    const response = await fresh.call();
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).results[0]?.id, DEAL.id, "the last good copy is the answer");
+    assert.equal(fresh.db.snapshotQueries, 0, "nothing is built in the request: the good copy is at the same revision");
+  });
+});
+
+test("a staff edit is answered with the copy in hand, and the next request gets the change", async () => {
+  const cache = fakeCache();
+  await withCache(cache, async () => {
+    const before = await isolate();
+    assert.equal((await before.call()).status, 200);
+    await settleBackgroundWork();
+    cache.store.delete(REVISION_RECORD);
+
+    // The edit: a new title, and a revision that names a key no copy exists under yet.
+    const edited = { ...DEAL, title: "Half-price wings, now with fries", updated_at: "2026-09-20 12:00:00" };
+    const after = await isolate("2026-09-20 12:00:00", { deals: [edited], branches: [] });
+    const first = await after.call();
+    assert.equal(first.status, 200);
+    assert.equal((await first.json()).results[0]?.title, DEAL.title, "the request that finds the revision moved is answered with the copy in hand");
+    await settleBackgroundWork();
+    assert.ok(after.db.snapshotQueries > 0, "the current revision is built behind that request");
+
+    const second = await after.call();
+    assert.equal((await second.json()).results[0]?.title, edited.title, "and the next request has the edit");
+    const other = await isolate("2026-09-20 12:00:00", { deals: [edited], branches: [] });
+    assert.equal((await (await other.call()).json()).results[0]?.title, edited.title, "as does every other isolate in the colo");
+    assert.equal(other.db.snapshotQueries, 0, "without building it again");
+  });
+});
+
+// A colo with nothing - cleared, or the first request after a deploy - reads the copy the deploy
+// baked (scripts/prerender-deals.mjs writes every shard under /__baked/deals-snapshot/) instead of
+// building from D1 while the visitor waits, then catches up behind the request.
+test("a colo with no copy at all serves the deploy's baked shard and builds behind", async () => {
+  const cache = fakeCache();
+  await withCache(cache, async () => {
+    const baked = { ...DEAL, title: "Half-price wings, as baked" };
+    const builder = await isolate(REVISION, { deals: [baked], branches: [] });
+    assert.equal((await builder.call()).status, 200);
+    await settleBackgroundWork();
+    // What the deploy would have written: the colo's copies, as files.
+    const files = new Map();
+    for (const [key, response] of cache.store) {
+      const match = key.match(/\/__deals-snapshot\/v(\d+)\/latest\/([^/]+)$/);
+      if (match) files.set(`/__baked/deals-snapshot/v${match[1]}/${match[2].replace(/:/g, "_")}.json`, await response.clone().text());
+    }
+    assert.ok(files.size >= 2, `the meta shard and the country shard are baked: ${[...files.keys()].join(", ")}`);
+    cache.store.clear();
+
+    const cold = await isolate("2026-09-21 09:00:00");
+    cold.env.ASSETS = { fetch: async (request) => { const path = new URL(request.url).pathname; return files.has(path) ? new Response(files.get(path), { status: 200 }) : new Response("Not found", { status: 404 }); } };
+    const response = await cold.call();
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).results[0]?.title, baked.title, "the baked shard is the answer");
+    await settleBackgroundWork();
+    assert.ok(cold.db.snapshotQueries > 0, "the current revision is built behind it");
+    assert.equal((await (await cold.call()).json()).results[0]?.title, DEAL.title, "and the next request is current");
   });
 });
 

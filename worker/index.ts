@@ -1,6 +1,7 @@
 /** Cloudflare Worker entry point for the vinext-starter template. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { env as startupEnv } from "cloudflare:workers";
 import { expireDealsStatement } from "../app/deal-lifecycle";
 import { MATURE_COMMISSIONS_SQL, holdCutoffModifier } from "../app/affiliate-program";
 import { sweepStaffReminders } from "../app/staff-reminders";
@@ -686,7 +687,7 @@ function cacheKeyFor(url: URL, env: Env, request: Request): Request {
 // in place is visibly a refusal — and that is the accepted trade: mirroring the redirect would mean
 // duplicating locale negotiation in this file, which is the thing it deliberately keeps out, to
 // conceal one bit about a document that holds the public deal catalog.
-const INTERNAL_CACHE_PATH = /^\/__(page-cache|photo-cache|deals-snapshot|deals-answer)(\/|$)/;
+const INTERNAL_CACHE_PATH = /^\/__(page-cache|photo-cache|deals-snapshot|deals-answer|baked)(\/|$)/;
 
 // A deal page answered 200 at three URLs besides its own: with a trailing slash, with ".html" on
 // the end (both handed the prerendered file back through the asset binding), and, for
@@ -795,6 +796,114 @@ async function prerenderedPage(request: Request, env: Env, url: URL): Promise<Re
     return new Response(null, { status: 200, headers });
   }
   return new Response(asset.body, { status: 200, headers });
+}
+
+// Addresses that are not a page, answered without the framework.
+//
+// Every address under a locale that no route claims renders the site's not-found page
+// (app/[locale]/[...rest]): header, footer, flight data, 13-30 ms of CPU locally against the
+// platform's ten, and a scanner or a broken link asks for a different one each time, so the colo's
+// hour-long copy of each (notFoundIsStorable) helps nothing. The same for a deal address whose slug
+// matches nothing, which is never stored at all, and for an /api/ address no route answers. Each is
+// answered here from the not-found page the deploy baked (scripts/prerender-deals.mjs, under
+// /__baked/404/), with the status, the locale cookie and the mark for a signed-in reader a render
+// would have given it - and, when no baked page exists (vinext dev, a deploy that skipped the
+// prerender), it is left to the render, so nothing here changes what a visitor sees.
+//
+// Only shapes no page can have (pageShape), never a judgement about a page's own content: a deal
+// that exists but is not public still renders its own 404, as does a city guide topic the
+// catalogue cannot fill, and so do the sign-in pages' own sub-paths. The city guides are the one
+// exception: every guide the catalogue can fill is baked at deploy, so an English guide address
+// with no baked file is not a guide (a city added since the last deploy appears with the next).
+const LOCALE_PAGES = new Set(["age-suitability", "cities", "confirm-email", "dashboard", "deals", "for-creators", "for-restaurants", "launch", "ottawa", "privacy", "pro", "sign-in", "sign-up", "support", "terms", "unsubscribe"]);
+
+/** Whether a locale path has the shape of a page the app routes, as app/[locale] lays them out (tests/worker-pages.test.mjs holds it to the files). */
+function pageShape(segments: string[]): boolean {
+  if (segments.length === 1) return true;
+  const [, page, third, fourth] = segments;
+  if (!LOCALE_PAGES.has(page)) return false;
+  if (segments.length === 2) return true;
+  if (page === "sign-in" || page === "sign-up") return true;
+  // A dashboard section that is not one is the app's own redirect to the overview, not a 404.
+  if (segments.length === 3) return page === "deals" || page === "cities" || page === "ottawa" || page === "dashboard";
+  return segments.length === 4 && page === "cities" && Boolean(third) && Boolean(fourth);
+}
+
+// The API routes, by path (app/api/**/route.ts); tests/worker-pages.test.mjs holds this list to the
+// files. The two with a parameter are matched by shape.
+const API_ROUTES = new Set(["/api/admin", "/api/admin/audit", "/api/admin/campaigns", "/api/admin/export", "/api/admin/growth", "/api/admin/handbook", "/api/admin/photo-upload", "/api/affiliate", "/api/creator", "/api/creator-applications", "/api/creator-picks", "/api/deals", "/api/deals/click", "/api/deals/feedback", "/api/email/capture", "/api/email/confirm", "/api/email/unsubscribe", "/api/email/webhooks/resend", "/api/feedback", "/api/iap/apple", "/api/iap/apple/notifications", "/api/jobs/billing", "/api/jobs/digests", "/api/jobs/geocode", "/api/jobs/launch-email", "/api/jobs/translate", "/api/pageview", "/api/portal", "/api/portal/photo-upload", "/api/referral-code", "/api/reports", "/api/restaurant-photo", "/api/session", "/api/stripe/checkout", "/api/stripe/portal", "/api/stripe/retention", "/api/stripe/webhook", "/api/suggestions", "/api/track", "/api/user", "/api/user/contributions", "/api/user/devices", "/api/user/export", "/api/user/history/export"]);
+
+function isApiRoute(pathname: string): boolean {
+  return API_ROUTES.has(pathname) || /^\/api\/deals\/[^/]+$/.test(pathname) || /^\/api\/photo\/.+/.test(pathname);
+}
+
+const NOT_FOUND_JSON = { error: { code: "NOT_FOUND", message: "No such route." } };
+
+/** The baked not-found page for `locale`, as the render would have sent it; null when the deploy baked none. */
+async function bakedNotFound(request: Request, env: Env, url: URL, locale: string): Promise<Response | null> {
+  if (!env.ASSETS) return null;
+  const file = await env.ASSETS.fetch(new Request(`${url.origin}/__baked/404/${locale}.html`, { method: "GET", headers: { accept: "text/html" } })).catch(() => null);
+  if (!file || file.status !== 200) {
+    await file?.body?.cancel();
+    return null;
+  }
+  const headers = new Headers({ "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", [SERVED_HEADER]: "baked" });
+  const secure = url.protocol === "https:" ? "; Secure" : "";
+  headers.set("Set-Cookie", `NEXT_LOCALE=${locale}; Path=/; SameSite=lax${secure}`);
+  if (request.method === "HEAD") {
+    await file.body?.cancel();
+    return new Response(null, { status: 404, headers });
+  }
+  const page = new Response(file.body, { status: 404, headers });
+  return isSignedIn(request) ? signedInCopy(page) : page;
+}
+
+/**
+ * An address no route answers, decided from its shape alone: the not-found page for a locale path
+ * no page can have, a small JSON 404 for an /api/ path, and the English guides for a guide address
+ * in another locale (which the page itself only redirects). Null for everything else.
+ */
+async function unknownAddress(request: Request, env: Env, url: URL): Promise<Response | null> {
+  if (request.method !== "GET" && request.method !== "HEAD") return null;
+  if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
+    return isApiRoute(url.pathname) ? null : Response.json(NOT_FOUND_JSON, { status: 404, headers: { "Cache-Control": "no-store" } });
+  }
+  if (isFlightRequest(request, url)) return null;
+  const segments = url.pathname.split("/").filter(Boolean);
+  const locale = segments[0];
+  if (!locale || !CACHEABLE_LOCALES.has(locale)) return null;
+  if (locale !== "en" && segments[1] === "cities" && segments.length >= 3) {
+    return new Response(null, { status: 308, headers: { Location: `/en/${segments.slice(1).map(encodeURIComponent).join("/")}`, "Cache-Control": "public, max-age=86400" } });
+  }
+  if (pageShape(segments)) return null;
+  return bakedNotFound(request, env, url, locale);
+}
+
+/**
+ * A page address that has the shape of a page but names none, decided after the baked lookup
+ * missed: an English guide no file was baked for, and a deal address whose slug and id match no
+ * deal at all - one indexed read, where the render that answered it cost a dozen times more and
+ * was never stored. Null when the page may exist, and for a reader whose page is personal.
+ */
+async function missingPage(request: Request, env: Env, url: URL): Promise<Response | null> {
+  if (request.method !== "GET" && request.method !== "HEAD") return null;
+  if (isFlightRequest(request, url)) return null;
+  const segments = url.pathname.split("/").filter(Boolean);
+  const locale = segments[0];
+  if (!locale || !CACHEABLE_LOCALES.has(locale)) return null;
+  if (locale === "en" && segments[1] === "cities" && segments.length >= 3) return bakedNotFound(request, env, url, locale);
+  if (segments[1] === "deals" && segments.length === 3 && env.DB) {
+    let slug: string;
+    try {
+      slug = decodeURIComponent(segments[2]);
+    } catch {
+      return bakedNotFound(request, env, url, locale);
+    }
+    const row = await env.DB.prepare("SELECT 1 AS found FROM deals WHERE slug=? OR id=? OR id IN (SELECT canonical_deal_id FROM deal_aliases WHERE alias_id=?) LIMIT 1").bind(slug, slug, slug).first().catch(() => undefined);
+    // A failed read leaves the page to the render, which has its own answer for that.
+    if (row === null) return bakedNotFound(request, env, url, locale);
+  }
+  return null;
 }
 
 // Signed out, /{locale}/dashboard and /{locale}/dashboard/{section} are a redirect to the sign-in
@@ -1397,6 +1506,11 @@ const worker = {
     const signIn = signedOutDashboardRedirect(request, url);
     if (signIn) return withSecurityHeaders(signIn, url);
 
+    // An address no route answers, from its shape alone - see unknownAddress. Ahead of the lookup
+    // and the admission gate, like a probe: it costs a file, never a render.
+    const unknown = internal ? null : await unknownAddress(request, env, url);
+    if (unknown) return withSecurityHeaders(unknown, url);
+
     // Deliberately ahead of the admission gate: neither a baked file nor a cache hit costs
     // meaningful CPU, so refusing one for concurrency would be turning away the cheap requests to
     // protect capacity that only the expensive ones consume. The baked file first, then the colo's
@@ -1468,9 +1582,27 @@ const worker = {
       // and RootShell would mark and personalize a render that saw the session cookie.
       if (lookup?.signedIn) request = new Request(request, { headers: signedOutHeaders(request.headers) });
       const deadline = renderDeadlineMs(Date.now(), env.RENDER_DEADLINE_MS);
-      let outcome = isWatchedRender(request, url)
-        ? await withinDeadline(renderPage(request, env, ctx), deadline)
-        : await renderPage(request, env, ctx);
+      let outcome: Response | typeof RENDER_TIMED_OUT;
+      if (isWatchedRender(request, url)) {
+        // No baked file and no copy in the colo: a guide that is not one, or a deal address that
+        // matches nothing, is answered with the not-found page before any render (missingPage).
+        // Under the slot and the same watchdog as the render, so a D1 that hangs holds this
+        // request the way it holds a render, and is answered the same way.
+        const started = Date.now();
+        const missing = lookup ? await withinDeadline(missingPage(request, env, url), deadline) : null;
+        if (missing === RENDER_TIMED_OUT) outcome = RENDER_TIMED_OUT;
+        else if (missing) return withSecurityHeaders(missing, url);
+        else outcome = await withinDeadline(renderPage(request, env, ctx), Math.max(1, deadline - (Date.now() - started)));
+      } else {
+        // An API route that throws is answered with a small 503 and a Retry-After, not with the
+        // framework's error page: the page is a render, on a path that is already in trouble.
+        try {
+          outcome = await renderPage(request, env, ctx);
+        } catch (cause) {
+          console.error(`${request.method} ${url.pathname} threw`, cause);
+          return withSecurityHeaders(Response.json({ error: { code: "UNAVAILABLE", message: "Radar could not answer that just now. Try again in a moment." } }, { status: 503, headers: { "Retry-After": "2", "Cache-Control": "no-store" } }), url);
+        }
+      }
       if (outcome === RENDER_TIMED_OUT) {
         return await answerWithoutRender(request, env, url, cache, cacheKey, staleHit, impersonal, deadline, lookup?.signedIn ?? false);
       }
@@ -1641,5 +1773,32 @@ const worker = {
     if (env.TRANSLATE_JOB_SECRET) await runCronJob(env, ctx, origin, env.TRANSLATE_JOB_SECRET, "translate", "translate_job_failed");
   },
 };
+
+// Warmed before the first request.
+//
+// A fresh isolate's first request paid 7-9 ms of CPU before any work of its own (measured locally:
+// a deal by slug 8.8 ms on the first request and 1.6 on the second, a located search 10-12 then
+// 4-6): the framework's router, its request and response machinery and this file, compiled and
+// run for the first time. On the free plan's ten milliseconds that first request was the one most
+// likely to be cut off - and the platform starts a fresh isolate for a burst of traffic, after a
+// deploy and whenever it moves the Worker, so a busy minute was a minute of first requests.
+//
+// One request through the framework at startup, to the cheapest route there is, compiles the
+// shared half of that once per isolate: the same measurement then gives 1.5 ms and 3.8 ms. Startup
+// has its own allowance, apart from any request's (hundreds of milliseconds to evaluate the global
+// scope; see docs/CPU-BUDGET.md). /api/session with no cookie reads headers and answers, touching neither
+// D1 nor the cache - the global scope may not do I/O - and whatever the runtime refuses here is
+// caught: the warm-up ends early and the first request is simply what it was. Never awaited at the
+// top level, which the runtime does not allow; a request arriving before it settles is answered
+// as before.
+export const warmed: Promise<void> = (async () => {
+  try {
+    const request = new Request("https://radar.cheap/api/session", { headers: { host: "radar.cheap", accept: "application/json" } });
+    const response = await handler.fetch(request, startupEnv as unknown as Env, { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext);
+    await response.body?.cancel();
+  } catch {
+    // Not a request: nothing to answer, nothing to fail.
+  }
+})();
 
 export default worker;

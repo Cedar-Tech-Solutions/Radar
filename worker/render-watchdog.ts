@@ -62,7 +62,7 @@ export function renderDeadlineMs(now: number, override?: string): number {
  * rather than left holding a stream open. A rejection before the deadline propagates exactly as it
  * would have without the watchdog.
  */
-export async function withinDeadline(render: Promise<Response>, ms: number): Promise<Response | typeof RENDER_TIMED_OUT> {
+export async function withinDeadline<T extends Response | null>(render: Promise<T>, ms: number): Promise<T | typeof RENDER_TIMED_OUT> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<typeof RENDER_TIMED_OUT>((resolve) => {
     timer = setTimeout(() => resolve(RENDER_TIMED_OUT), ms);
@@ -70,7 +70,7 @@ export async function withinDeadline(render: Promise<Response>, ms: number): Pro
   try {
     const winner = await Promise.race([render, deadline]);
     if (winner === RENDER_TIMED_OUT) {
-      render.then((late) => late.body?.cancel().catch(() => {}), () => {});
+      render.then((late) => late?.body?.cancel().catch(() => {}), () => {});
     }
     return winner;
   } finally {

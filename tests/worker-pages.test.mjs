@@ -1017,3 +1017,224 @@ test("security.txt names a contact and an expiry that is always ahead and under 
   const days = (expires.getTime() - Date.now()) / 86_400_000;
   assert.ok(days > 90 && days < 365, `${days} days`);
 });
+
+// ── Addresses no page can have ───────────────────────────────────────────────────────────────────
+//
+// Every unknown address under a locale used to be a render of the not-found page - 13-30 ms of CPU
+// locally against the platform's ten - and a different one each time for a scanner or a broken link, so
+// the colo's stored copy of each helped nothing. The Worker now answers the shapes no page can
+// have (pageShape) and the deal addresses that match nothing (missingPage, one indexed read) from
+// the not-found page the deploy baked, with the status, cookie and mark a render would have given
+// them; an /api/ path no route answers gets a small JSON 404. What follows checks each, and the
+// half that matters more: that no page the app really has is answered that way.
+
+const NOT_FOUND_EN = "<!doctype html><html lang=\"en\"><body>baked not found</body></html>";
+const NOT_FOUND_FR = "<!doctype html><html lang=\"fr\"><body>introuvable, cuite</body></html>";
+const BAKED_404 = { "/__baked/404/en.html": NOT_FOUND_EN, "/__baked/404/fr.html": NOT_FOUND_FR };
+
+test("an address no page can have is the baked not-found page, never a render and never stored", async () => {
+  const worker = await isolate();
+  const cache = colo();
+  globalThis.caches = cache;
+  try {
+    const env = { DB: hangingD1(), ASSETS: assets(BAKED_404) };
+    for (const [path, lang] of [["/en/no-such-page", "en"], ["/fr/pas-une-page", "fr"], ["/en/deals/x/y", "en"], ["/en/privacy/extra", "en"], ["/en/cities/a/b/c", "en"], ["/en/ottawa/wings/more", "en"]]) {
+      const ctx = context();
+      const response = await call(worker, env, `${ORIGIN}${path}`, { headers: { accept: PAGE } }, ctx);
+      assert.equal(response.status, 404, path);
+      assert.equal(response.headers.get("x-radar-served"), "baked", path);
+      assert.equal(response.headers.get("cache-control"), "no-store", path);
+      assert.match(response.headers.get("set-cookie"), new RegExp(`^NEXT_LOCALE=${lang}; Path=/; SameSite=lax; Secure$`), path);
+      assert.equal(response.headers.get("x-content-type-options"), "nosniff", path);
+      assert.equal(await response.text(), lang === "fr" ? NOT_FOUND_FR : NOT_FOUND_EN, path);
+      await ctx.settle();
+    }
+    // A signed-in reader's copy carries the mark their menu reads; a HEAD has no body to mark.
+    const marked = await call(worker, env, `${ORIGIN}/en/no-such-page`, { headers: { accept: PAGE, cookie: "__session=eyJhbGciOiJSUzI1NiJ9.e30.sig" } });
+    assert.equal(marked.status, 404);
+    assert.match(await marked.text(), /^<!doctype html><html data-signed-in="" lang="en">/);
+    const head = await call(worker, env, `${ORIGIN}/en/no-such-page`, { method: "HEAD", headers: { accept: PAGE } });
+    assert.equal(head.status, 404);
+    assert.equal(head.body, null);
+    assert.deepEqual(cache.puts, [], "nothing is stored for an address a scanner will never ask for twice");
+    assert.deepEqual(logged.filter((line) => line.includes("timed out")), [], "and D1, which never answered, was never asked");
+  } finally {
+    delete globalThis.caches;
+  }
+});
+
+test("a locale path the deploy baked no not-found page for is still rendered", async () => {
+  const worker = await isolate();
+  globalThis.caches = colo();
+  try {
+    const env = { DB: emptyD1(), ASSETS: assets() };
+    const response = await call(worker, env, `${ORIGIN}/en/no-such-page`, { headers: { accept: PAGE } });
+    assert.equal(response.status, 404);
+    assert.equal(response.headers.get("x-radar-served"), null, "a render");
+    assert.match(await response.text(), /<html/);
+  } finally {
+    delete globalThis.caches;
+  }
+});
+
+test("a deal address that matches nothing costs one read, and a deal that exists is rendered", async () => {
+  const worker = await isolate();
+  const cache = colo();
+  globalThis.caches = cache;
+  try {
+    const db = catalogueD1();
+    const env = { DB: db, ASSETS: assets(BAKED_404) };
+    const ctx = context();
+    const missing = await call(worker, env, `${ORIGIN}/en/deals/not-a-deal`, { headers: { accept: PAGE } }, ctx);
+    assert.equal(missing.status, 404);
+    assert.equal(missing.headers.get("x-radar-served"), "baked");
+    assert.equal(await missing.text(), NOT_FOUND_EN);
+    assert.equal(db.reads.deal, 0, "the page was never rendered");
+    await ctx.settle();
+    assert.ok(!cache.store.has(`${KEY}/en/deals/not-a-deal`), "and nothing stored: the deal may be published a minute from now");
+
+    // By slug, by id, and by an alias's id: each a deal, each rendered.
+    for (const address of ["corner-wings", "corner-tacos", "corner-wings-twin"]) {
+      const page = await call(worker, env, `${ORIGIN}/en/deals/${address}`, { headers: { accept: PAGE } });
+      assert.notEqual(page.headers.get("x-radar-served"), "baked", address);
+      assert.ok(page.status === 200 || page.status === 307 || page.status === 308, `${address}: ${page.status}`);
+      await page.body?.cancel();
+    }
+    assert.ok(db.reads.deal >= 2, "the pages that exist were rendered");
+    // A draft is a deal that exists but is not public: its own render decides, not the Worker.
+    const draft = await call(worker, env, `${ORIGIN}/en/deals/corner-draft`, { headers: { accept: PAGE } });
+    assert.equal(draft.status, 404);
+    assert.equal(draft.headers.get("x-radar-served"), null, "rendered");
+    await draft.body?.cancel();
+
+    // A D1 that refuses leaves the page to the render, which has its own answer for that.
+    db.control.broken = true;
+    const refused = await call(worker, env, `${ORIGIN}/en/deals/not-a-deal`, { headers: { accept: PAGE } });
+    assert.notEqual(refused.headers.get("x-radar-served"), "baked");
+    await refused.body?.cancel();
+  } finally {
+    delete globalThis.caches;
+  }
+});
+
+test("a deal address whose read hangs is answered by the watchdog, not held forever", async () => {
+  const worker = await isolate();
+  globalThis.caches = colo();
+  try {
+    const env = { DB: hangingD1(), ASSETS: assets(BAKED_404), RENDER_DEADLINE_MS: "100" };
+    const started = Date.now();
+    const response = await call(worker, env, `${ORIGIN}/en/deals/stuck`, { headers: { accept: PAGE } });
+    assert.ok(Date.now() - started < 2000, "answered within the deadline");
+    assert.equal(response.status, 503);
+    await response.body?.cancel();
+  } finally {
+    delete globalThis.caches;
+  }
+});
+
+test("every page the app has is left to its own route, never answered as an address no page can have", async () => {
+  const worker = await isolate();
+  globalThis.caches = colo();
+  try {
+    // The guides are baked at deploy (every one the catalogue can fill), so the two here are files.
+    const env = { DB: catalogueD1(), ASSETS: assets({ ...BAKED_404, "/en/cities/ottawa": HOME, "/en/cities/ottawa/wings": HOME }) };
+    // One address per page file under app/[locale], with each parameter filled in.
+    const pages = [];
+    const walk = (dir, segments) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) walk(`${dir}/${entry.name}`, [...segments, entry.name]);
+        else if (entry.name === "page.tsx") pages.push(segments);
+      }
+    };
+    walk(new URL("../app/[locale]", import.meta.url).pathname, []);
+    assert.ok(pages.length >= 20, `${pages.length} pages`);
+    const fill = { "[city]": "ottawa", "[topic]": "wings", "[slug]": "corner-wings", "[section]": "saved", "[[...sign-in]]": "factor-one", "[[...sign-up]]": "verify-email-address" };
+    for (const segments of pages) {
+      if (segments[0] === "[...rest]") continue; // the catch-all is what the baked page stands in for
+      const path = `/en${segments.map((segment) => `/${fill[segment] ?? segment}`).join("")}`;
+      const response = await call(worker, env, `${ORIGIN}${path}`, { headers: { accept: PAGE } });
+      assert.ok(!(response.status === 404 && response.headers.get("x-radar-served") === "baked"), `${path} is a page the app has`);
+      await response.body?.cancel();
+    }
+    // The dashboard's unknown section is the app's own redirect to the overview, not a 404.
+    const section = await call(worker, env, `${ORIGIN}/en/dashboard/not-a-section`, { headers: { accept: PAGE } });
+    assert.notEqual(section.headers.get("x-radar-served"), "baked");
+    await section.body?.cancel();
+    // And every section the dashboard has, signed in, is a render.
+    const { dashboardSections } = await import("../app/[locale]/dashboard/sections.ts");
+    for (const name of dashboardSections) {
+      const page = await call(worker, env, `${ORIGIN}/en/dashboard/${name}`, { headers: { accept: PAGE, cookie: "__session=eyJhbGciOiJSUzI1NiJ9.e30.sig" } });
+      assert.notEqual(page.headers.get("x-radar-served"), "baked", name);
+      await page.body?.cancel();
+    }
+  } finally {
+    delete globalThis.caches;
+  }
+});
+
+test("a guide address in another locale is one redirect to the English guide, and an English guide with no baked file is not a guide", async () => {
+  const worker = await isolate();
+  globalThis.caches = colo();
+  try {
+    const env = { DB: hangingD1(), ASSETS: assets({ ...BAKED_404, "/en/cities/ottawa": "<!doctype html><html lang=\"en\"><body>the Ottawa guide</body></html>" }) };
+    const guide = await call(worker, env, `${ORIGIN}/fr/cities/ottawa`, { headers: { accept: PAGE } });
+    assert.equal(guide.status, 308);
+    assert.equal(guide.headers.get("location"), "/en/cities/ottawa");
+    assert.equal(guide.headers.get("cache-control"), "public, max-age=86400");
+    const topic = await call(worker, env, `${ORIGIN}/es/cities/ottawa/wings`, { headers: { accept: PAGE } });
+    assert.equal(topic.status, 308);
+    assert.equal(topic.headers.get("location"), "/en/cities/ottawa/wings");
+    const index = await call(worker, env, `${ORIGIN}/fr/cities`, { headers: { accept: PAGE } });
+    assert.notEqual(index.status, 308, "the index page exists in every locale");
+    await index.body?.cancel();
+
+    const baked = await call(worker, env, `${ORIGIN}/en/cities/ottawa`, { headers: { accept: PAGE } });
+    assert.equal(baked.status, 200);
+    assert.equal(baked.headers.get("x-radar-served"), "baked");
+    await baked.text();
+    const missing = await call(worker, env, `${ORIGIN}/en/cities/atlantis`, { headers: { accept: PAGE } });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.headers.get("x-radar-served"), "baked");
+    assert.equal(await missing.text(), NOT_FOUND_EN);
+  } finally {
+    delete globalThis.caches;
+  }
+});
+
+test("an /api/ address no route answers is a small JSON 404; the routes themselves are the files under app/api", async () => {
+  const worker = await isolate();
+  const env = { DB: hangingD1(), ASSETS: assets(BAKED_404) };
+  for (const path of ["/api/no-such-route", "/api", "/api/deals/click/extra", "/api/admin/nope"]) {
+    const response = await call(worker, env, `${ORIGIN}${path}`, { headers: { accept: "application/json" } });
+    assert.equal(response.status, 404, path);
+    assert.equal(response.headers.get("cache-control"), "no-store", path);
+    assert.deepEqual(await response.json(), { error: { code: "NOT_FOUND", message: "No such route." } }, path);
+  }
+  // The Worker's list is the files, so a route added under app/api is answered the day it lands.
+  const source = readFileSync(new URL("../worker/index.ts", import.meta.url), "utf8");
+  const listed = JSON.parse(source.match(/^const API_ROUTES = new Set\((\[.*\])\);$/m)[1]);
+  const files = [];
+  const walk = (dir, segments) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) walk(`${dir}/${entry.name}`, [...segments, entry.name]);
+      else if (entry.name === "route.ts") files.push(`/api${segments.map((segment) => `/${segment}`).join("")}`);
+    }
+  };
+  walk(new URL("../app/api", import.meta.url).pathname, []);
+  assert.deepEqual([...listed].sort(), files.filter((path) => !path.includes("[")).sort());
+  assert.deepEqual(files.filter((path) => path.includes("[")).sort(), ["/api/deals/[slug]", "/api/photo/[...key]"], "the two routes with a parameter, matched by shape in isApiRoute");
+  for (const path of ["/api/deals/some-deal", "/api/photo/restaurants/x.jpg", "/api/session"]) {
+    const response = await call(worker, { ...env, DB: emptyD1() }, `${ORIGIN}${path}`, { headers: { accept: "application/json" } });
+    assert.notEqual(await response.text(), JSON.stringify({ error: { code: "NOT_FOUND", message: "No such route." } }), `${path} is a route`);
+  }
+});
+
+test("the deploy's own files are never served as an address", async () => {
+  const worker = await isolate();
+  const env = { DB: emptyD1(), ASSETS: assets({ ...BAKED_404, "/__baked/deals-snapshot/v1/meta.json": "{}" }) };
+  for (const path of ["/__baked/404/en.html", "/__baked/deals-snapshot/v1/meta.json", "/__baked", "/__baked/"]) {
+    const response = await call(worker, env, `${ORIGIN}${path}`, { headers: { accept: PAGE } });
+    assert.equal(response.status, 404, path);
+    assert.doesNotMatch(await response.text(), /baked not found|^\{\}$/, path);
+  }
+});

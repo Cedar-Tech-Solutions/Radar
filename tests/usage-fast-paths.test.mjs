@@ -149,6 +149,21 @@ test("a signed-in request has no shared answer", () => {
   assert.equal(sharedAnswerKey(new Request(url, { headers: { cookie: "theme=dark; __session=x" } }), url), null);
 });
 
+// A browse that names no place and no country - the site's first paint for a reader who has not
+// shared a location, a keyword search - is placed in the network's country, so two networks are
+// never handed one answer; a request that names any of those is keyed on what it names alone.
+test("an unplaced browse is keyed on the network's country; a placed one is not", () => {
+  const unplaced = new URL("https://radar.cheap/api/deals?limit=5&q=wings");
+  const from = (country) => new Request(unplaced, { headers: country ? { "cf-ipcountry": country } : {} });
+  assert.equal(sharedAnswerKey(from("CA"), unplaced).url, "https://radar.cheap/__deals-answer/v1/?limit=5&q=wings&%7Enetwork-country=CA");
+  assert.equal(sharedAnswerKey(from("US"), unplaced).url, "https://radar.cheap/__deals-answer/v1/?limit=5&q=wings&%7Enetwork-country=US");
+  assert.equal(sharedAnswerKey(from(null), unplaced).url, "https://radar.cheap/__deals-answer/v1/?limit=5&q=wings&%7Enetwork-country=");
+  for (const placed of ["country=US", "province=ON", "city=Ottawa", "postal=K1A", "lat=45.4&lng=-75.7&country=CA&tz=America%2FToronto"]) {
+    const url = new URL(`https://radar.cheap/api/deals?limit=5&${placed}`);
+    assert.doesNotMatch(sharedAnswerKey(new Request(url, { headers: { "cf-ipcountry": "CA" } }), url).url, /network-country/, placed);
+  }
+});
+
 const CTX = (pending = []) => ({ waitUntil(promise) { pending.push(Promise.resolve(promise).catch(() => {})); }, passThroughOnException() {} });
 
 // D1 that records what it is asked and answers nothing.
@@ -169,7 +184,9 @@ test("the Worker hands an anonymous reader the colo's answer without the app, an
   try {
     const event = JSON.stringify({ market: "CA", properties: JSON.stringify({ term: "wings", matches: 3 }) });
     cache.store.set(
-      "https://radar.cheap/__deals-answer/v1/?limit=5&q=wings",
+      // A keyword search names no place, so it is placed in the network's country (browseCountry in
+      // the route), which is part of its key; a request from no known country is its own answer.
+      "https://radar.cheap/__deals-answer/v1/?limit=5&q=wings&%7Enetwork-country=",
       new Response(JSON.stringify({ results: [], marker: "shared" }), {
         headers: { "content-type": "application/json", "cache-control": "public, max-age=110", "x-radar-search-event": event },
       }),

@@ -94,6 +94,12 @@ export function sharedAnswerKey(request: Request, url: URL): Request | null {
       params.push(["~network-region", network.region && network.point && kmBetween(point, network.point) <= NETWORK_REGION_KM ? network.region : ""]);
     }
   }
+  // A browse that names no place and no country is placed in the network's country (browseCountry
+  // in the route), so that is part of its question too.
+  if (!url.searchParams.has("lat") && !url.searchParams.has("lng") && !url.searchParams.get("city")?.trim() && !url.searchParams.get("postal")?.trim() &&
+      !url.searchParams.get("country")?.trim() && !url.searchParams.get("province")?.trim()) {
+    params.push(["~network-country", networkOf(request).country || ""]);
+  }
   return new Request(`${url.origin}/__deals-answer/v${ANSWER_CACHE_VERSION}/?${new URLSearchParams(params)}`, { method: "GET" });
 }
 
