@@ -279,12 +279,14 @@ test("the home hero counts the same cards the list does", async () => {
   assert.match(home, /setCatalogCities\(d\.cityCount \|\| 0\)/);
   assert.match(home, /t\("hero\.catalogCount", \{ restaurants: catalogRestaurants, cities: catalogCities \}\)/);
   const route = code(await read("../app/api/deals/route.ts"));
-  // Both figures come from the local list the cards are grouped from, before any filter.
+  // Both figures are counted over the whole catalogue the way the local list is grouped, before
+  // any filter - once per meta shard (catalogCounts), since a request no longer reads the whole
+  // catalogue to count it - and every request takes them from there.
   assert.match(route, /const grouped = Array\.from\(local\.reduce\(/);
-  assert.match(route, /const totalCanonicalOffers = grouped\.length;/);
-  // The cities, by the same function the place picker's list is counted by, so the hero and the
-  // picker are one number (tests/search-api.test.mjs runs both).
-  assert.match(route, /for \(const deal of grouped\) for \(const city of offerCities\(deal\)\) catalogCities\.add\(city\);\s*const cityCount = catalogCities\.size;/);
+  assert.match(route, /function catalogCounts\(rows: readonly MetaRow\[\], chainsSeparate: boolean\): CountSet/);
+  assert.match(route, /cards\.add\(!row\.canonical_restaurant_id \? row\.id : row\.is_chain \? row\.canonical_restaurant_id : `\$\{row\.canonical_restaurant_id\}\|\$\{row\.address\}`\);/);
+  assert.match(route, /const counts = chainsSeparate \? meta\.counts\.separate : meta\.counts\.all;\s*const totalCanonicalOffers = counts\.cards;\s*const cityCount = hideAlcohol \? counts\.foodCities : counts\.cities;/);
+  // The cities the picker lists are counted by the same rule (tests/search-api.test.mjs runs both).
   assert.match(route, /cities: citiesByOffer \? cityTotals\(\) : count\("primary_city"\)/);
   assert.match(route, /uniqueOfferCount:totalCanonicalOffers,\s*cityCount,/);
   assert.doesNotMatch(route, /sourcedOfferCount|sourcedCityCount/);

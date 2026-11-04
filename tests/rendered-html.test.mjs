@@ -156,7 +156,11 @@ async function renderShared(path,headers = {}) {
 // nothing. The noisy one carries a cookie whose name merely contains "__session=", which the Worker's
 // signed-in check (isSignedIn) takes for a session and so renders the address as it came, and which
 // nothing in a render reads (REQUEST_READS in tests/route-params.test.mjs lists the cookies that are).
+// A page that reads nothing of its reader (USER_BLIND_ROUTES in worker/index.ts) is rendered without
+// the cookie and marked for the signed-in reader afterwards; the mark is the one difference meant,
+// and is taken off before the two are compared.
 const RENDER_AS_SENT = { cookie:"x__session=1" };
+const withoutSignedInMark = (html) => html.replace('<html data-signed-in=""','<html');
 
 // The sign-in pages render only in a build that carries Clerk's publishable key, as CI's and every
 // deploy's does: without one, <SignIn/> has no provider and throws. A build made without the key (a
@@ -179,6 +183,6 @@ test("a page asked for with parameters its server render ignores is the bare pag
     assert.equal(noisy.status,200,path);
     const [bareHtml,noisyHtml] = [await bare.text(),await noisy.text()];
     assert.notEqual(noisyHtml,bareHtml,`${path}: the echo should differ, or this compares nothing`);
-    assert.equal(withoutAddressEcho(noisyHtml),withoutAddressEcho(bareHtml),`${path} rendered differently for a query its server render should ignore`);
+    assert.equal(withoutAddressEcho(withoutSignedInMark(noisyHtml)),withoutAddressEcho(bareHtml),`${path} rendered differently for a query its server render should ignore`);
   }
 });

@@ -262,9 +262,13 @@ test("a personal request is never answered with the baked page or a stored copy"
       ["/en/deals/some-deal?postal=K1A0B1", {}],
       ["/en/deals/some-deal?zip=10001&utm_source=x", {}],
       ["/en/deals/some-deal?all=1", {}],
-      // A signed-in reader, by cookie or by token.
-      ["/en", { cookie: "theme=dark; __session=eyJhbGciOiJSUzI1NiJ9.e30.sig" }],
-      ["/en", { authorization: "Bearer eyJhbGciOiJSUzI1NiJ9.e30.sig" }],
+      // A signed-in reader, by cookie or by token, of a page that reads who they are (the deal page
+      // narrows its branches by their saved postal code). The pages that read nothing of them are
+      // answered from the shared copy, marked - the test below.
+      ["/en/deals/some-deal", { cookie: "theme=dark; __session=eyJhbGciOiJSUzI1NiJ9.e30.sig" }],
+      ["/en/deals/some-deal", { authorization: "Bearer eyJhbGciOiJSUzI1NiJ9.e30.sig" }],
+      ["/en/pro", { cookie: "__session=eyJhbGciOiJSUzI1NiJ9.e30.sig" }],
+      ["/en/launch", { cookie: "__session=eyJhbGciOiJSUzI1NiJ9.e30.sig" }],
       // A client-side navigation's flight, by header or by the framework's parameter.
       ["/en/deals/some-deal", { RSC: "1" }],
       ["/en?_rsc=1x2y3", {}],
@@ -280,6 +284,62 @@ test("a personal request is never answered with the baked page or a stored copy"
     const bare = await call(worker, env, `${ORIGIN}/en/launch`, { headers: { accept: PAGE } });
     assert.equal(bare.headers.get("x-radar-served"), "cache");
     assert.match(await bare.text(), /the colo's launch page/);
+  } finally {
+    delete globalThis.caches;
+  }
+});
+
+// A signed-in reader of a page that reads nothing of them - the home page, a static page, a city
+// guide - is handed the page every reader gets, with the mark RootShell would have put on <html>
+// added by the Worker, so the page's scripts mount Clerk and the account menu from it. Every page
+// such a reader opened used to be a full render, the costliest thing the Worker does, for staff
+// who are signed in on every visit.
+test("a signed-in reader of a page that reads nothing of them gets the shared copy, marked", async () => {
+  const worker = await isolate();
+  const cache = colo();
+  globalThis.caches = cache;
+  try {
+    cache.store.set(`${KEY}/en/support`, storedCopy("<!doctype html><html lang=\"en\"><body>the colo's support page</body></html>", MINUTE));
+    const env = { DB: emptyD1(), ASSETS: assets({ "/en": HOME }) };
+    const session = { cookie: "theme=dark; __session=eyJhbGciOiJSUzI1NiJ9.e30.sig" };
+    const token = { authorization: "Bearer eyJhbGciOiJSUzI1NiJ9.e30.sig" };
+
+    // The baked page, marked.
+    for (const headers of [session, token]) {
+      const baked = await call(worker, env, `${ORIGIN}/en?country=CA`, { headers: { accept: PAGE, ...headers } });
+      assert.equal(baked.headers.get("x-radar-served"), "baked");
+      assert.equal(baked.headers.get("cache-control"), "private, no-cache");
+      const html = await baked.text();
+      assert.match(html, /^<!doctype html><html data-signed-in="" lang="en">/, "the mark RootShell puts on a render that saw the cookie");
+      assert.match(html, /baked home/);
+    }
+    // A signed-out reader's copy of the same file carries no mark.
+    assert.doesNotMatch(await (await call(worker, env, `${ORIGIN}/en`, { headers: { accept: PAGE } })).text(), /data-signed-in/);
+
+    // The colo's copy, marked, and left as it was.
+    const hit = await call(worker, env, `${ORIGIN}/en/support`, { headers: { accept: PAGE, ...session } });
+    assert.equal(hit.headers.get("x-radar-served"), "cache");
+    assert.match(await hit.text(), /<html data-signed-in="" lang="en">.*the colo's support page/);
+    assert.doesNotMatch(stored(cache.store.get(`${KEY}/en/support`)).text, /data-signed-in/);
+    // A HEAD has no body to mark.
+    const head = await call(worker, env, `${ORIGIN}/en/support`, { method: "HEAD", headers: { accept: PAGE, ...session } });
+    assert.equal(head.headers.get("x-radar-served"), "cache");
+    assert.equal(head.body, null);
+
+    // A miss: rendered once, as a signed-out reader's, stored for everyone and handed to them marked.
+    const ctx = context();
+    const miss = await call(worker, env, `${ORIGIN}/en/privacy`, { headers: { accept: PAGE, ...session } }, ctx);
+    assert.equal(miss.status, 200);
+    assert.equal(miss.headers.get("x-radar-served"), null, "a render");
+    assert.equal(miss.headers.get("cache-control"), "private, no-cache", "the shared page, sent as one");
+    const rendered = await miss.text();
+    assert.match(rendered, /<html[^>]* data-signed-in=""/, "marked for this reader");
+    await ctx.settle();
+    const copy = stored(cache.store.get(`${KEY}/en/privacy`));
+    assert.equal(copy.status, 200);
+    // The page's own scripts name the mark (app/clerk-react.ts reads it); the <html> tag is what carries it.
+    assert.match(copy.text, /^<!DOCTYPE html><html lang="en">/, "the copy stored saw no cookie");
+    assert.equal(rendered.replace('<html data-signed-in="" lang="en">', '<html lang="en">'), copy.text, "and is otherwise the page the reader was sent");
   } finally {
     delete globalThis.caches;
   }

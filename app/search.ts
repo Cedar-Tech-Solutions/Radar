@@ -103,16 +103,25 @@ const NORMALIZED_CACHE_MAX = 5_000;
 const NORMALIZED_CACHE_MAX_CHARS = 2_000_000;
 let normalizedCacheChars = 0;
 
-export function normalizeSearch(value: string) {
-  const known = normalizedCache.get(value);
-  if (known !== undefined) return known;
-  const result = value
+/**
+ * The normalization itself, remembered nowhere. For text normalized once and kept - a deal's search
+ * text, worked out when its shard of the snapshot is built - where remembering the answer would only
+ * fill the cache below with strings no request will ask about again.
+ */
+export function foldSearch(value: string) {
+  return value
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/[^a-z0-9$%]+/g, " ")
     .trim()
     .replace(/\s+/g, " ");
+}
+
+export function normalizeSearch(value: string) {
+  const known = normalizedCache.get(value);
+  if (known !== undefined) return known;
+  const result = foldSearch(value);
   if (normalizedCache.size >= NORMALIZED_CACHE_MAX || normalizedCacheChars >= NORMALIZED_CACHE_MAX_CHARS) {
     normalizedCache.clear();
     normalizedCacheChars = 0;
@@ -147,7 +156,15 @@ function tokenCandidates(token: string) {
 }
 
 export function matchesQuery(searchDocument: string, query: string) {
-  const document = normalizeSearch(searchDocument);
+  return matchesNormalizedQuery(normalizeSearch(searchDocument), query);
+}
+
+/**
+ * matchesQuery for a document already normalized by foldSearch. The deals snapshot keeps every deal's
+ * search text that way, so a search over a thousand deals runs no normalization at all over them -
+ * it used to fold each deal's text on every request, which was most of what a keyword search cost.
+ */
+export function matchesNormalizedQuery(document: string, query: string) {
   const tokens = queryTokens(query);
   // queryTokens drops single-character tokens to keep multi-word searches from matching on
   // noise words — but a query that's ENTIRELY short tokens (a bare "5", a price like "$5")
@@ -168,10 +185,15 @@ export function matchesQuery(searchDocument: string, query: string) {
 
 export function relevanceScore(searchDocument: string, query: string, restaurant: string, title: string) {
   if (!query.trim()) return 0;
+  return relevanceOfNormalized(normalizeSearch(searchDocument), query, restaurant, title);
+}
+
+/** relevanceScore for a document already normalized by foldSearch; see matchesNormalizedQuery. */
+export function relevanceOfNormalized(document: string, query: string, restaurant: string, title: string) {
+  if (!query.trim()) return 0;
   const normalizedQuery = normalizeSearch(query);
   const normalizedRestaurant = normalizeSearch(restaurant);
   const normalizedTitle = normalizeSearch(title);
-  const document = normalizeSearch(searchDocument);
   let score = 0;
   if (normalizedRestaurant === normalizedQuery) score += 1000;
   else if (normalizedRestaurant.startsWith(normalizedQuery)) score += 600;

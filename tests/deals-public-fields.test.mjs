@@ -41,6 +41,7 @@ const SERVER_ONLY = [
   "search_keywords", "search_score", "indexed", "internal_notes", "deleted_at", "publish_at", "owner_confirmed_at",
   "under_review", "location_eligibility", "location_id", "eligible_location_id", "primary_city", "national_chain",
   "discount_percent", "savings_cents", "restaurant_footprint", "restaurant_country", "restaurant_phone", "location_website",
+  "search_text", "footprint_regions",
 ];
 
 function seed() {
@@ -105,10 +106,11 @@ test("the copy of the catalog kept outside the database carries no staff notes",
   } finally {
     delete harness.env.PHOTOS;
   }
-  const snapshot = stored.find(([key]) => key.startsWith("internal/deals-snapshot/"));
-  assert.ok(snapshot, "the snapshot was stored");
-  assert.match(snapshot[1], /Half-price appetizers/);
-  assert.doesNotMatch(snapshot[1], new RegExp(NOTE));
+  // In shards: the meta shard carries no deal, and the cells around the point carry the deals.
+  const snapshots = stored.filter(([key]) => key.startsWith("internal/deals-snapshot/"));
+  assert.ok(snapshots.length > 0, "the snapshot was stored");
+  assert.ok(snapshots.some(([, body]) => /Half-price appetizers/.test(body)), "a shard holds the deal");
+  for (const [key, body] of snapshots) assert.doesNotMatch(body, new RegExp(NOTE), key);
 });
 
 test("a request for many ids is answered for the first page's worth", async () => {

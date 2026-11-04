@@ -5,14 +5,15 @@ import { underReviewSql } from "../../accuracy-reports";
 import {
   availabilityFromSchedule,
   availabilityFromStructuredSchedule,
+  foldSearch,
   kmBetween,
-  matchesQuery,
+  matchesNormalizedQuery,
   nextRadius,
   normalizeSearch,
   offerRunsOn,
   optionalCoordinate,
   parseList,
-  relevanceScore,
+  relevanceOfNormalized,
   safeCursor,
   safeLimit,
   scheduleShape,
@@ -29,7 +30,7 @@ import { deviceCountry, roughTimezone } from "../../country-at";
 import { displayCity, resolveCityText, resolvePostal, type GeocodeGuard } from "../../postal";
 import { categoryLabel, cuisineLabel } from "../../i18n/staticEnums";
 import { dealLabels, isSupportedLocale, type SupportedLocale } from "../../i18n/dealLabels";
-import { PAYLOAD_LOCATION_MAX, capDealLocations, compactDeal } from "../../dealView";
+import { capDealLocations, compactDeal } from "../../dealView";
 import { READABLE_FIELDS as PRINTED_FIELDS, referencesAlcohol } from "../../alcohol";
 import { baseRow, rowBase } from "../../deals-snapshot-rows";
 import { ANONYMOUS_ANSWER_CACHE_CONTROL, NETWORK_REGION_KM, answerFromShared, answerToShare, knownTimezone, networkOf, sharedAnswerKey, type Network } from "../../deals-answer";
@@ -117,6 +118,9 @@ interface DealRow {
   restaurant_country: string | null;
   restaurant_footprint: string | null;
   restaurant_locator_url: string | null;
+  // How many branches run a per-branch deal, in two halves - see DEAL_COLUMNS and buildBases.
+  confirmed_rows: number | null;
+  own_confirmed: number | null;
 }
 
 /** One operating branch of a restaurant that has at least one public deal. */
@@ -141,17 +145,6 @@ interface EligibilityRow {
   location_id: string;
   eligibility: string;
   source_url: string | null;
-}
-
-/**
- * A large brand's branches, held once per snapshot rather than once per deal, with the two lookups
- * a request needs from them. Only `branches` is serialised; the rest is rebuilt from it.
- */
-interface BrandIndex {
-  branches: BranchRow[];
-  byId: Map<string, BranchRow>;
-  byRegion: Map<string, BranchRow[]>;
-  cells: Map<string, BranchRow[]>;
 }
 
 interface SearchTermRow {
@@ -230,7 +223,7 @@ interface OfferSummary {
   available_today: boolean;
 }
 
-type NormalizedDeal = Omit<DealRow, "restaurant" | "slug" | "is_chain" | "hidden_gem" | "national_chain"> & {
+type NormalizedDeal = Omit<DealRow, "restaurant" | "slug" | "is_chain" | "hidden_gem" | "national_chain" | "confirmed_rows" | "own_confirmed"> & {
   restaurant: string;
   slug: string;
   is_chain: boolean;
@@ -243,20 +236,25 @@ type NormalizedDeal = Omit<DealRow, "restaurant" | "slug" | "is_chain" | "hidden
   participating_locations: NormalizedLocation[];
   other_brand_locations: NormalizedLocation[];
   /**
-   * Set on a deal whose restaurant is a large brand (see LARGE_BRAND_MIN_BRANCHES). Its three
-   * location arrays are empty in the snapshot and drawn per request from `brands`, and the two
-   * counts below are the real totals, measured when the snapshot was built.
+   * How many of the chain's branches run the offer, measured over every branch when the deal's
+   * shard was built; the shard itself carries only the branches near its readers. The lists above
+   * are never longer than this. Compare chain_location_count, the chain's branches in all.
    */
-  brand_ref?: string;
-  participating_location_count?: number;
-  /** Explicit deal_locations rows for a large brand's per-branch deal, as [eligibility, source]. */
-  location_eligibility?: Record<string, [string, string | null]>;
+  participating_location_count: number;
   /**
    * A 'national' deal's regions, from its brand's footprint: the states or provinces the chain
    * trades in. Null when nobody has counted, which places the deal everywhere in its country.
    */
   footprint_regions?: string[] | null;
   search_keywords: string;
+  /**
+   * Everything a keyword search reads of the deal - search_keywords, its restaurant, title, schedule
+   * and price - already normalized (foldSearch in app/search.ts), worked out once when its shard of
+   * the snapshot is built. A search used to normalize this for every deal on every request: a dozen
+   * regular expressions over the catalogue's whole text, and most of what a keyword search cost. A
+   * card's is every deal's it groups, joined.
+   */
+  search_text: string;
   distance_km: number | null;
   availability: string;
   available_today: boolean;
@@ -324,7 +322,7 @@ function widerRadius(radius: number, maxRadius: number) {
   return next != null && next <= maxRadius ? next : null;
 }
 
-function searchKeywords(deal: DealRow) {
+function searchKeywords(deal: Pick<DealRow, "canonical_restaurant" | "restaurant" | "title" | "category" | "cuisine">) {
   return Array.from(new Set([
     deal.canonical_restaurant, deal.restaurant, deal.title, deal.category, deal.cuisine,
     ...(keywordSets[deal.category] || []), ...(keywordSets[deal.cuisine] || []),
@@ -347,58 +345,54 @@ function requestGeocodeGuard() {
   return { guard, state };
 }
 
-// The four reads below and the two indexes derived from them are identical for every
-// visitor — only q/location/filters differ per request, and those are applied further
-// down. Holding the result in the isolate turns the common case from "4 D1 round trips
-// + a full re-index" into a map lookup.
+// The catalogue is held in a snapshot — the visitor-independent half of every public deal, indexed
+// once — so that a request is a map lookup and some filtering rather than four D1 round trips and
+// a full re-index. Only q/location/filters differ per request, and those are applied further down.
 //
-// This used to be pinned to 60s to match the response's own `max-age=60`, so a cached
-// snapshot could never be staler than the CDN copy a visitor might already hold. That
-// constraint no longer applies: the snapshot holds only each deal's static half, and
-// everything time-dependent — availability, "Available now" vs "Later today", distance,
-// search score — is computed per request from `new Date()` against these rows. The
-// response still says max-age=60 because that live half really does go stale in a
-// minute; the rows underneath it only change when staff edit a deal, which is a
-// several-times-a-day event, not a per-minute one. So the window is set by how long a
-// staff edit may take to surface, not by anything a visitor can observe drifting.
+// The snapshot is in shards (see DealsShard): a request loads the one or few it is about and never
+// the rest. It used to be one object holding the whole catalogue, and every request paid for all of
+// it: a cold isolate parsed three megabytes before it could answer anyone, and a search from
+// downtown Ottawa measured, grouped and filtered every deal in Vancouver and Austin to find the
+// thirty it reached. On the Workers free plan a request has ten milliseconds of CPU, and the whole
+// catalogue cost more than that before the search began. Each shard is small enough that reading it
+// is well under the limit, and building one from D1 is a bounded query rather than a pass over
+// everything.
 //
-// A day now, which in practice means never: the revision below carries the date, so every snapshot
-// is replaced at midnight UTC before this could run out. It is a backstop for a write that changes
-// a row without touching anything the revision reads, and nothing more.
+// What is held is still only each deal's static half, and everything time-dependent — availability,
+// "Available now" vs "Later today", distance, search score — is computed per request from
+// `new Date()` against these rows. The response says max-age=60 because that live half really does
+// go stale in a minute; the rows underneath it only change when staff edit a deal, which is a
+// several-times-a-day event, not a per-minute one.
 //
-// It used to be the main way a snapshot got rebuilt. At three hours, a colo whose data had not
-// changed at all still rebuilt from D1 eight times a day - 27,999 rows each on a copy of
-// production - and at thirty minutes before that, forty-eight. Everything it was standing in for
-// is in the revision now: updated_at and rowid maxima for the four big tables, change counters for
-// deletions and for the four small tables (drizzle/0049), the count of deals still waiting on
-// their publish_at, and the date for the 30-day "stale" label.
+// A day, which in practice means never: the revision below moves on every write to anything a shard
+// is built from, and a shard is replaced when it does. The TTL is a backstop for a write that
+// changes a row without touching anything the revision reads, and nothing more.
 const SNAPSHOT_TTL_MS = 24 * 60 * 60_000;
+/** A verified deal whose check is older than this is labelled stale (app/verification.ts says the same of its page). */
+const STALE_AFTER_MS = 30 * 24 * 60 * 60_000;
 
 /**
- * A brand with more branches than this is held once in the snapshot's `brands` instead of being
- * copied into every one of its deals, and each request draws only the branches it needs.
- *
- * McDonald's alone is 10,482 US branches. Copied into its deal as chain_locations, that brand made
- * the serialised snapshot 18.9 MB, and every request walked every branch of every chain card: far
- * more CPU than a request is allowed. Below this size nothing changes - every Canadian chain,
- * Tim Hortons' 120 included, keeps its exact per-deal behaviour, which is where the grouping rules
- * further down were learned.
+ * How far past a map cell's own edges its deals' branch lists reach, in kilometres. A located search
+ * is answered from the cells its radius touches, and a card's branches are read from the copy of the
+ * deal in the reader's own cell: that copy has to carry every branch within the largest radius of
+ * any point in the cell, which is this far past the cell's edge. See maxRadiusKm in app/radius.ts.
  */
-const LARGE_BRAND_MIN_BRANCHES = 300;
+const CELL_BRANCH_REACH_KM = 50;
 
 /**
- * The most branches of one large brand a request carries through grouping. Within a radius that is
- * every branch in range up to this many; unscoped it is a page's worth. The response is capped
- * harder still (PAYLOAD_LOCATION_MAX), and the true totals travel as their own fields.
+ * The branches a deal carries in a country's shard, per state or province of its chain. An unplaced
+ * card shows a page of branches and the province filter asks whether the chain has one in the
+ * province; a sample of each answers both. The true totals travel beside them (chain_location_count,
+ * participating_location_count), measured over every branch when the shard is built.
  */
-const BRAND_SUBSET_MAX = 300;
+const BRANCHES_PER_REGION = 8;
 
 /** The largest page of the compact nationwide list - see where `limit` is read in GET. */
 const NATIONAL_PAGE_MAX = 200;
 /** The most ids one request may ask for - see where `id` is read in GET. */
 const MAX_REQUESTED_IDS = 50;
 // Everything about a deal that is the same for every visitor at every moment: its locations, its
-// search text, its price tier. Built once per snapshot instead of once per request.
+// search text, its price tier. Built once per shard instead of once per request.
 //
 // Splitting the per-deal work this way is the point. The old map rebuilt all of this on every
 // request — for 133 deals it re-derived each one's chain_locations array, re-concatenated its
@@ -406,36 +400,75 @@ const MAX_REQUESTED_IDS = 50;
 // a millisecond apart. What genuinely does change per request is small and stays below:
 // availability (the clock), distance (where the visitor is) and search score (what they typed).
 type DealBase = Omit<NormalizedDeal, "availability" | "available_today" | "available_now" | "availability_phase" | "tonight" | "distance_km" | "search_score" | "expiry_timezone"> & {
-  /** Kept for metadataWeight, which depends on the query and so cannot be precomputed. */
+  /** Kept for metadataWeight, which depends on the query and so cannot be precomputed. Each term already normalized. */
   indexed: Array<{ term: string; weight: number }>;
 };
 
-// Only what a request actually reads. The rows and term lists the build works from used to be
-// carried here too, and nothing consumed them: `bases` already spreads each deal row, embeds its
-// locations as chain_locations and its terms as `indexed`, so they were the same data a second and
-// third time. Dropping them roughly thirds what has to be held in every isolate — and, since this
-// is the object now shared through the Cache API, what has to be serialised and parsed.
-type DealsSnapshot = {
+/**
+ * One shard of the snapshot: the deals one kind of request reads, with their translations.
+ *
+ * Keyed by what a request is about, and built by a bounded D1 query for exactly that:
+ *
+ *   cell:<lat>:<lng>   the deals confirmed at a branch inside one map cell, a degree of latitude and
+ *                      longitude (70-111 km across where Radar is read). A located search loads the
+ *                      cells its radius reaches - one to four, nine at most. Each deal carries the
+ *                      branches within CELL_BRANCH_REACH_KM of the cell, which is every branch any
+ *                      search from inside it can reach.
+ *   country:<CC>       every deal with a branch in the country, for a search with no place: each
+ *                      chain's branches as a sample per province or state (BRANCHES_PER_REGION).
+ *                      One shard for the country, not one per province: a request may make fifty
+ *                      subrequests on the free plan, and every shard read is one of them, as is
+ *                      every D1 query and every cache write of a build. Reading a dozen provinces
+ *                      for one unplaced search was over that budget before any deal was looked at.
+ *   national:<CC>      the promotions with no branch at all, placed by their brand's country and
+ *                      footprint (drizzle/0050).
+ *
+ * A request for deals by id - the Saved tab - is answered from a shard built for its ids and held
+ * by nobody: fifty deals at most, read from D1 as asked.
+ */
+type DealsShard = {
+  key: string;
   bases: DealBase[];
-  /** Large brands' branches, keyed by restaurant id. See LARGE_BRAND_MIN_BRANCHES. */
-  brands: Map<string, BrandIndex>;
-  coverageRows: MarketCoverageRow[];
   translationsByDeal: Map<string, Partial<Record<SupportedLocale, DealTranslationRow>>>;
+  expiresAt: number;
+  /** The data revision this shard was built from. See readRevision. */
+  revision: string;
+};
+
+/** The homepage's hero numbers, counted over the whole catalogue - see catalogCounts. */
+type CountSet = { cards: number; cities: number; foodCities: number };
+
+/**
+ * What every request reads whatever it asks for, held as a shard of its own under the key "meta":
+ * the markets and where they are, the alias map, which countries the catalogue has deals in, and
+ * the catalogue's own counts, which a request answered from one cell cannot count for itself.
+ */
+type DealsMeta = {
+  key: typeof META_KEY;
+  coverageRows: MarketCoverageRow[];
+  /**
+   * Where each market is, for a search that names none - see app/market-coverage.ts. Worked out
+   * when the shard is built and carried in its copies, because it is a pass over every deal.
+   */
+  centers: MarketCenter<MarketCoverageRow>[];
   /**
    * deal_aliases, as the old id or slug of a folded duplicate to the id of the deal it was folded
    * into, followed to the end. Ten rows after drizzle/0056. See where `ids` is read in GET.
    */
   aliases: Map<string, string>;
-  /**
-   * Where each market is, for a search that names none - see app/market-coverage.ts. Worked out
-   * when the snapshot is built and carried in its copies, because it is a pass over every deal: done
-   * on the first located request instead, it was half a millisecond of every cold isolate's CPU.
-   */
-  centers: MarketCenter<MarketCoverageRow>[];
+  /** The countries with a public deal, for a search that names no country and no place. */
+  countries: string[];
+  /** With national chains in the local list (`all`), and with them in a section of their own (`separate`). */
+  counts: { all: CountSet; separate: CountSet };
+  /** The newest source check over the whole public catalogue; see where latestVerificationDate is set. */
+  latestSourceCheck: string | null;
   expiresAt: number;
-  /** The data revision this snapshot was built from. See readRevision. */
   revision: string;
 };
+
+type Stored = DealsShard | DealsMeta;
+const META_KEY = "meta";
+const isMeta = (stored: Stored): stored is DealsMeta => stored.key === META_KEY;
 
 // How often an isolate re-asks whether the underlying data has changed. Not the same question as
 // the TTL above, which asks whether this copy is old; this asks whether it is wrong.
@@ -498,8 +531,12 @@ let revisionCheckedAt = 0;
  *
  * The waiting count is for publish_at. A deal scheduled for later becomes public when its time
  * passes without any row changing; the count of deals still waiting falls at that moment, from a
- * partial index holding only the scheduled ones. The date is for the 30-day "stale" label the
- * select computes: one rebuild a day is what it costs to keep that label honest.
+ * partial index holding only the scheduled ones.
+ *
+ * The date is not here any more. It was, for the 30-day "stale" label the select computes, and it
+ * made every colo rebuild the whole snapshot at midnight UTC; the label is read against the clock
+ * per request now (see where effective_verification_status is set in GET), so nothing is rebuilt
+ * on a timer.
  */
 async function readRevision(): Promise<string> {
   const row = await env.DB.prepare(
@@ -513,14 +550,13 @@ async function readRevision(): Promise<string> {
       " (SELECT MAX(rowid) FROM deal_locations) en," +
       " (SELECT MAX(rowid) FROM deal_aliases) an," +
       " (SELECT group_concat(n,'.') FROM data_changes) x," +
-      " (SELECT COUNT(*) FROM deals WHERE publish_at IS NOT NULL AND datetime(publish_at)>datetime('now')) w," +
-      " date('now') t",
+      " (SELECT COUNT(*) FROM deals WHERE publish_at IS NOT NULL AND datetime(publish_at)>datetime('now')) w",
   ).first<{ d: string | null; r: string | null; l: string | null; e: string | null;
             dn: number | null; rn: number | null; ln: number | null; en: number | null; an: number | null;
-            x: string | null; w: number | null; t: string | null }>();
+            x: string | null; w: number | null }>();
   return [row?.d ?? "", row?.r ?? "", row?.l ?? "", row?.e ?? "",
           row?.dn ?? "", row?.rn ?? "", row?.ln ?? "", row?.en ?? "", row?.an ?? "",
-          row?.x ?? "", row?.w ?? "", row?.t ?? ""].join("|");
+          row?.x ?? "", row?.w ?? ""].join("|");
 }
 
 /**
@@ -569,94 +605,81 @@ async function currentRevision(origin: string): Promise<string> {
   }
   return revision;
 }
-let cachedSnapshot: DealsSnapshot | null = null;
+// The shards this isolate holds, by key, most recently used last. Bounded: a busy isolate in a big
+// colo is asked about many cells, and the ones it has not been asked about in a while are let go.
+const held = new Map<string, Stored>();
+const HELD_MAX = 64;
+function hold(stored: Stored) {
+  held.delete(stored.key);
+  held.set(stored.key, stored);
+  while (held.size > HELD_MAX) {
+    const oldest = held.keys().next().value;
+    if (oldest === undefined) break;
+    held.delete(oldest);
+  }
+}
+// The data revision this isolate last learned (see currentRevision): what every held shard is
+// compared with. Empty until the first request learns it, or while D1 will not say.
+let knownRevision = "";
 // Requests this isolate has answered, for the x-radar-isolate header in GET.
 let isolateRequests = 0;
-// Single-flight guard: without it a burst of concurrent requests arriving on a cold or
-// just-expired isolate would each launch their own copy of the four queries.
-let snapshotInFlight: Promise<DealsSnapshot> | null = null;
-let snapshotStartedAt = 0;
+// Single-flight guards, per shard: without them a burst of concurrent requests arriving on a cold
+// or just-expired isolate would each launch their own copy of the build.
+//
 // A build running inside a request the Workers runtime hard-kills for exceeding its own resource
-// limit is torn down without ever settling: the promise neither resolves nor rejects, so the
-// `.finally` below never runs and the guard keeps pointing at it forever. Every later request on
-// that isolate with no cached snapshot then awaits a promise that will never complete: requests
-// that burn almost no CPU and then sit until the client gives up — no exception, just a hang, on
-// an isolate that stays wedged for the rest of its life while its neighbors serve the same URL
-// fine.
+// limit is torn down without ever settling: the promise neither resolves nor rejects, so a
+// `.finally` never runs and a guard keeps pointing at it forever. Every later request on that
+// isolate then awaits a promise that will never complete: requests that burn almost no CPU and then
+// sit until the client gives up — no exception, just a hang, on an isolate that stays wedged for
+// the rest of its life while its neighbors serve the same URL fine.
 //
 // This is the same failure as the leaked admission slots in worker/index.ts, which self-heal by
 // aging out for exactly this reason: state cleaned up only on a path a killed request never
 // reaches needs a deadline, not a `finally`. An in-flight build older than this is abandoned and
 // a fresh one started, so a wedged isolate recovers on its next request instead of never.
 const SNAPSHOT_BUILD_DEADLINE_MS = 10_000;
+type InFlight = { promise: Promise<Stored>; startedAt: number };
+const buildsInFlight = new Map<string, InFlight>();
+const catchUpsInFlight = new Map<string, InFlight>();
 
 // Sharing one snapshot across the isolates in a colo, through the Cache API.
 //
 // Each isolate used to build its own. That is fine until a deploy, which discards every isolate at
-// once: each replacement then rebuilt the snapshot out of D1 on its first request — five queries
-// reading every public deal, every search term, every deal/location pair — once per isolate,
-// everywhere. That multiplies row reads by the number of isolates on every deploy, and once the
-// database's read allowance runs out a cold isolate cannot build at all and /api/deals returns 500
-// while its warm neighbors serve the same URL perfectly.
+// once: each replacement then rebuilt the snapshot out of D1 on its first request — once per
+// isolate, everywhere. That multiplies row reads by the number of isolates on every deploy, and
+// once the database's read allowance runs out a cold isolate cannot build at all and /api/deals
+// returns 500 while its warm neighbors serve the same URL perfectly.
 //
-// So the build is now written where the next isolate can find it. A cold isolate reads the colo's
-// copy instead of D1, which makes a deploy cost one build per colo rather than one per isolate,
-// and lets a cold isolate serve even when D1 is unavailable.
+// So the build is written where the next isolate can find it. A cold isolate reads the colo's copy
+// instead of D1, which makes a deploy cost one build per colo rather than one per isolate, and lets
+// a cold isolate serve even when D1 is unavailable.
 //
 // Versioned by hand, and deliberately not by deployment id: keying on the deploy would throw this
-// away on every deploy, which is the exact cost it exists to avoid.
-//
-// The consequence to know about is that a deploy no longer clears it. An isolate started by a new
-// version will adopt a snapshot the previous version built, and serve it until it goes stale —
-// under half an hour, since the TTL above still governs refreshes. That is harmless for a change
-// to how deals are filtered or rendered, which happens after the snapshot on every request, but it
-// does mean a change to what buildBases puts *into* a snapshot takes effect on a delay.
-//
-// So bump this when the serialised shape changes, and also when what goes into it changes in a way
-// the new code depends on. If that is ever forgotten, readSharedSnapshot's validation is the net
-// for the first case — it rejects anything that does not deserialise into the expected shape and
-// falls back to a build — but it cannot catch the second, which is why it is written down here.
-// Bump this for a change to the serialised shape, or to what buildBases puts into a snapshot. Do
-// not bump it to publish a data change: the key carries the data revision now, so that happens by
-// itself. See snapshotCacheKey and readRevision.
+// away on every deploy, which is the exact cost it exists to avoid. Bump this for a change to the
+// serialised shape, or to what buildBases puts into a shard. Do not bump it to publish a data
+// change: the key carries the data revision, so that happens by itself. See snapshotCacheKey and
+// readRevision.
 //
 // It went from 1 to 2 on 2026-09-19 for exactly that wrong reason, and the history is worth
 // keeping because it is what the revision mechanism was built from. scripts/chain-groups.mjs
-// merged 39 branch restaurant records into 9 brands. D1 was correct immediately - the API's own
-// join returned one "Kelseys Original Roadhouse" with 21 deals - and the site still served the
-// pre-merge names 48 minutes later. 15 consecutive requests, all stale, no cf-cache-status header,
-// so it was this snapshot and not Cloudflare's edge.
-//
-// The comment above used to promise such a copy goes stale "under half an hour, since the TTL
-// above still governs refreshes". It does not. loadSnapshot served the stale copy and scheduled a
+// merged 39 branch restaurant records into 9 brands. D1 was correct immediately and the site still
+// served the pre-merge names 48 minutes later: loadSnapshot served the stale copy and scheduled a
 // background refresh that did rebuild and did call writeSharedSnapshot, but the shared copy never
-// changed, so every fresh isolate adopted the same stale snapshot again. Uniformly stale rather
-// than a mix is what ruled out "only some isolates are affected": no isolate ever published a new
-// copy. A TTL answers "is this old?", and nothing was asking "is this wrong?".
-// 3 on 2026-09-27: large brands' branches moved out of their deals into `brands`, a real change of
-// shape - a v2 copy would deserialise into deals with every branch and no brand index.
-// 4 on 2026-09-28: deals as positional rows, the derived location lists no longer sent. A v3 copy
-// has `bases` and no `rows`, and deserializeSnapshot would refuse it anyway.
-// 5 on 2026-09-28: deals back to objects, with each branch sent once in `sites`. Version 4's rows
-// were rebuilt into dictionary-mode objects that made every request slower - see serializeSnapshot.
-// 6 on 2026-09-28: national_chain on every deal (drizzle/0051), which chains=separate reads. A v5
-// copy built after the migration but by the code before it would lack the field under a revision
-// the new code would otherwise accept.
-// 7 on 2026-09-28: `brand` on every deal (drizzle/0052), which group=brand reads - for the same reason.
-// 8 on 2026-09-30: `aliases`, the deal_aliases map, which a request by id now resolves through, and
-// `centers`, where each market is. A v7 copy has neither, and deserializeSnapshot refuses it rather
-// than serve a Saved list without the one or place every point in no market without the other.
-// 9 on 2026-10-03: most deals as positional rows again, rebuilt this time by an object literal
+// changed, so every fresh isolate adopted the same stale snapshot again. A TTL answers "is this
+// old?", and nothing was asking "is this wrong?".
+// 3 on 2026-09-27: large brands' branches moved out of their deals into `brands`.
+// 4 and 5 on 2026-09-28: deals as positional rows, then back to objects with each branch sent once.
+// 6, 7 on 2026-09-28: national_chain and `brand` on every deal (drizzle/0051, 0052).
+// 8 on 2026-09-30: `aliases` and `centers`.
+// 9 on 2026-10-03: most deals as positional rows again, rebuilt by an object literal
 // (app/deals-snapshot-rows.ts). A v8 reader would take a row for a deal with no fields.
-// 10 on 2026-10-07: a branch and a site carry whether their coordinate is only a city centroid. A v9
-// reader would refuse the longer site arrays anyway; the bump makes that a version check.
-// 11 on 2026-10-07: `under_review` on every deal (drizzle/0068), which the recommended order reads. A
-// v10 copy lacks it and would rank a reported deal as though nobody had questioned it.
-// 12 on 2026-10-07: owner_confirmed_at on every deal (drizzle/0069). A v11 row is a field short, so
-// rowBase would refuse it and the deal would be dropped rather than served.
-// 13 on 2026-10-11: internal_notes is blank in every copy. A v12 copy still carries the notes, and
-// the version moves so that none of it is read again.
-const SNAPSHOT_CACHE_VERSION = 13;
+// 10, 11, 12 on 2026-10-07: approximate coordinates, under_review, owner_confirmed_at.
+// 13 on 2026-10-11: internal_notes is blank in every copy.
+// 14 on 2026-11-04: the snapshot in shards. A copy is one cell, country or nationwide list, or the
+// meta shard, each under its own key; a deal carries its normalized search text and its measured
+// branch totals, and no deal refers to a brand index any more. A v13 copy is the whole catalogue
+// under one key, which no reader asks for.
+const SNAPSHOT_CACHE_VERSION = 14;
 // A fallback, not a source of truth: the in-memory TTL above still decides when a refresh happens.
 // This only bounds how long a colo may hold a copy nothing has refreshed.
 const SNAPSHOT_CACHE_MAX_AGE_S = 24 * 60 * 60;
@@ -676,16 +699,15 @@ function snapshotCache(): Cache | null {
 // D1 without anything having to purge anything. Copies under superseded keys are never read again
 // and fall out on their own when SNAPSHOT_CACHE_MAX_AGE_S expires.
 //
-// Hashed rather than interpolated because the revision is three timestamps, which carry spaces and
-// colons, and a cache key is a URL.
-const snapshotCacheKey = (origin: string, revision: string) =>
-  new Request(
-    `${origin}/__deals-snapshot/v${SNAPSHOT_CACHE_VERSION}/r${revisionTag(revision)}`,
-    { method: "GET" },
-  );
+// Hashed rather than interpolated because the revision is a dozen timestamps and counters, which
+// carry spaces and colons, and a cache key is a URL. The shard's own key follows: "meta", or
+// "cell:45:-76", "country:CA", "national:US".
+const snapshotCacheKey = (origin: string, key: string, revision: string) =>
+  new Request(`${origin}/__deals-snapshot/v${SNAPSHOT_CACHE_VERSION}/r${revisionTag(revision)}/${key}`, { method: "GET" });
 
 /**
- * Where the newest snapshot is also published, under a name that needs no D1 lookup to construct.
+ * Where the newest copy of a shard is also published, under a name that needs no D1 lookup to
+ * construct.
  *
  * Learning the revision costs a query, and the one moment that matters most is the moment D1 will
  * not answer one: a cold isolate during an outage could otherwise not even work out which key to
@@ -694,10 +716,10 @@ const snapshotCacheKey = (origin: string, revision: string) =>
  * the stale copy; serving yesterday's deals beats serving an error.
  *
  * The "r" prefix on revision tags above keeps them disjoint from this name, so a hash can never
- * collide with it.
+ * collide with it; "current-revision" (revisionCacheKey) is disjoint from both.
  */
-const snapshotFallbackKey = (origin: string) =>
-  new Request(`${origin}/__deals-snapshot/v${SNAPSHOT_CACHE_VERSION}/latest`, { method: "GET" });
+const snapshotFallbackKey = (origin: string, key: string) =>
+  new Request(`${origin}/__deals-snapshot/v${SNAPSHOT_CACHE_VERSION}/latest/${key}`, { method: "GET" });
 
 /** A short, URL-safe tag for a revision string. Collision-resistance is all that is asked of it. */
 function revisionTag(revision: string) {
@@ -709,37 +731,23 @@ function revisionTag(revision: string) {
   return hash.toString(36);
 }
 
-// A branch goes over the wire as a positional array rather than an object: at 21,615 branches the
-// repeated key names alone were megabytes of the payload every cold isolate has to parse.
-type PackedBranch = [string, string, string, string | null, string, string, number | null, number | null, string | null, number];
-const packBranch = (b: BranchRow): PackedBranch =>
-  [b.location_id, b.address, b.city, b.region, b.country, b.postal_prefix, b.latitude, b.longitude, b.official_url, b.approximate ? 1 : 0];
-const unpackBranch = (restaurantId: string, p: PackedBranch): BranchRow => ({
-  location_id: p[0], restaurant_id: restaurantId, address: p[1], city: p[2], region: p[3], country: p[4],
-  postal_prefix: p[5], latitude: p[6], longitude: p[7], official_url: p[8], approximate: p[9] ? 1 : 0,
-});
-
-// translationsByDeal and brands are Maps, which JSON drops silently rather than complaining about,
-// so they go over as entries and are rebuilt on the way back. A brand is sent as its branches only;
-// its lookups are derived again by indexBrand.
-//
-// The deals go over as objects, and every branch a deal names once, in `sites`. Both halves of that
-// are about CPU, because a cold isolate parses the whole snapshot before it can answer anyone, and
-// every megabyte parsed is CPU taken from the request's allowance.
+// The deals go over as rows, and every branch a deal names once, in `sites`. Both halves of that
+// are about CPU, because a cold isolate parses a shard before it can answer anyone, and every
+// kilobyte parsed is CPU taken from the request's allowance.
 //
 // Size. The two lists derived from chain_locations - the branches that carry the offer and the
 // ones that do not - are not sent, and are rebuilt from offer_available exactly as buildBases makes
 // them. chain_locations itself goes as [site, eligibility, source?] per branch: every deal a chain
-// runs used to repeat the chain's whole branch list, 804 KB of a 2.4 MB snapshot, when all that
-// differs from one deal to the next is what the deal says about each branch.
+// runs used to repeat the chain's whole branch list, when all that differs from one deal to the
+// next is what the deal says about each branch.
 //
 // Shape. Version 4 sent the deals as positional rows under one list of field names, which halved
-// the bytes, and rebuilt each deal by assigning its 76 fields by computed name. V8 keeps an object
-// built that way in dictionary mode, and a request copies every deal in the catalog: the copy went
-// from under 1 ms to 12.5 ms, so the snapshot got smaller and every request after the first got
-// slower. JSON.parse builds its objects the fast way, and so does an object literal: version 9
-// sends rows again and rebuilds each with one (app/deals-snapshot-rows.ts), and a deal is only ever
-// given fields by name afterwards.
+// the bytes, and rebuilt each deal by assigning its fields by computed name. V8 keeps an object
+// built that way in dictionary mode, and a request copies every deal it reads: the copy went from
+// under 1 ms to 12.5 ms, so the snapshot got smaller and every request after the first got slower.
+// JSON.parse builds its objects the fast way, and so does an object literal: version 9 sends rows
+// again and rebuilds each with one (app/deals-snapshot-rows.ts), and a deal is only ever given
+// fields by name afterwards.
 
 /** A branch as a deal's location uses it: the fields locationOf reads. */
 type Site = { location_id: string | null; address: string; city: string; region: string | null; postal_prefix: string; latitude: number | null; longitude: number | null; approximate?: number | boolean };
@@ -780,10 +788,30 @@ function packLocations(base: DealBase, sites: PackedSite[], siteIndex: Map<strin
   return packed;
 }
 
-function serializeSnapshot(snapshot: DealsSnapshot) {
+function serializeSnapshot(stored: Stored) {
+  if (isMeta(stored)) {
+    return JSON.stringify({
+      v: SNAPSHOT_CACHE_VERSION,
+      key: stored.key,
+      expiresAt: stored.expiresAt,
+      revision: stored.revision,
+      coverageRows: stored.coverageRows,
+      aliases: [...stored.aliases],
+      countries: stored.countries,
+      counts: stored.counts,
+      latestSourceCheck: stored.latestSourceCheck,
+      // A centre names its market by its place in coverageRows, which travel beside it. Only one the
+      // reader will accept: an entry it refuses costs the whole copy, and every isolate that read it
+      // would go back to D1.
+      centers: stored.centers.flatMap((center) => {
+        const index = stored.coverageRows.indexOf(center.row);
+        return index >= 0 && Number.isFinite(center.latitude) && Number.isFinite(center.longitude) ? [[index, center.latitude, center.longitude]] : [];
+      }),
+    });
+  }
   const sites: PackedSite[] = [];
   const siteIndex = new Map<string, number>();
-  const bases = snapshot.bases.map((base) => {
+  const bases = stored.bases.map((base) => {
     const { participating_locations: _participating, other_brand_locations: _others, ...rest } = base;
     const packed = packLocations(base, sites, siteIndex);
     const deal = packed ? { ...rest, chain_locations: packed } : rest;
@@ -792,50 +820,62 @@ function serializeSnapshot(snapshot: DealsSnapshot) {
   });
   return JSON.stringify({
     v: SNAPSHOT_CACHE_VERSION,
-    expiresAt: snapshot.expiresAt,
-    revision: snapshot.revision,
+    key: stored.key,
+    expiresAt: stored.expiresAt,
+    revision: stored.revision,
     sites,
     bases,
-    brands: [...snapshot.brands].map(([id, index]) => [id, index.branches.map(packBranch)]),
-    coverageRows: snapshot.coverageRows,
-    translations: [...snapshot.translationsByDeal],
-    aliases: [...snapshot.aliases],
-    // A centre names its market by its place in coverageRows, which travel beside it. Only one the
-    // reader will accept: an entry it refuses costs the whole copy, and every isolate that read it
-    // would go back to D1.
-    centers: snapshot.centers.flatMap((center) => {
-      const index = snapshot.coverageRows.indexOf(center.row);
-      return index >= 0 && Number.isFinite(center.latitude) && Number.isFinite(center.longitude) ? [[index, center.latitude, center.longitude]] : [];
-    }),
+    translations: [...stored.translationsByDeal],
   });
 }
 
 // Strict on purpose. Anything unrecognised returns null and the caller builds from D1, so a shape
-// change that forgets to bump the version costs one rebuild rather than serving a snapshot whose
-// fields the reading code no longer understands.
-function deserializeSnapshot(raw: unknown): DealsSnapshot | null {
+// change that forgets to bump the version costs one rebuild rather than serving a copy whose
+// fields the reading code no longer understands. `key` is what the caller asked for: a copy of
+// another shard under this name is refused too.
+function deserializeSnapshot(raw: unknown, key: string): Stored | null {
   if (!raw || typeof raw !== "object") return null;
   const data = raw as Record<string, unknown>;
-  if (data.v !== SNAPSHOT_CACHE_VERSION) return null;
+  if (data.v !== SNAPSHOT_CACHE_VERSION || data.key !== key) return null;
   if (typeof data.expiresAt !== "number") return null;
-  if (!Array.isArray(data.sites) || !Array.isArray(data.bases) ||
-      !Array.isArray(data.coverageRows) || !Array.isArray(data.translations) || !Array.isArray(data.brands) ||
-      !Array.isArray(data.aliases) || !Array.isArray(data.centers)) return null;
-  for (const entry of data.aliases as unknown[]) {
-    if (!Array.isArray(entry) || typeof entry[0] !== "string" || typeof entry[1] !== "string") return null;
+  const revision = typeof data.revision === "string" ? data.revision : "";
+  if (key === META_KEY) {
+    if (!Array.isArray(data.coverageRows) || !Array.isArray(data.aliases) || !Array.isArray(data.centers) ||
+        !Array.isArray(data.countries) || !data.counts || typeof data.counts !== "object") return null;
+    for (const entry of data.aliases as unknown[]) {
+      if (!Array.isArray(entry) || typeof entry[0] !== "string" || typeof entry[1] !== "string") return null;
+    }
+    const counts = data.counts as Record<string, unknown>;
+    const countSet = (value: unknown): CountSet | null => {
+      if (!value || typeof value !== "object") return null;
+      const set = value as Record<string, unknown>;
+      return typeof set.cards === "number" && typeof set.cities === "number" && typeof set.foodCities === "number"
+        ? { cards: set.cards, cities: set.cities, foodCities: set.foodCities } : null;
+    };
+    const all = countSet(counts.all), separate = countSet(counts.separate);
+    if (!all || !separate) return null;
+    const coverageRows = data.coverageRows as MarketCoverageRow[];
+    const centers: DealsMeta["centers"] = [];
+    for (const entry of data.centers as unknown[]) {
+      if (!Array.isArray(entry)) return null;
+      const [index, latitude, longitude] = entry as unknown[];
+      const row = typeof index === "number" ? coverageRows[index] : undefined;
+      if (!row || typeof latitude !== "number" || typeof longitude !== "number") return null;
+      centers.push({ row, latitude, longitude });
+    }
+    return {
+      key: META_KEY,
+      coverageRows,
+      centers,
+      aliases: new Map(data.aliases as Array<[string, string]>),
+      countries: (data.countries as unknown[]).filter((value): value is string => typeof value === "string"),
+      counts: { all, separate },
+      latestSourceCheck: typeof data.latestSourceCheck === "string" ? data.latestSourceCheck : null,
+      expiresAt: data.expiresAt,
+      revision,
+    };
   }
-  const coverageRows = data.coverageRows as DealsSnapshot["coverageRows"];
-  const centers: DealsSnapshot["centers"] = [];
-  for (const entry of data.centers as unknown[]) {
-    if (!Array.isArray(entry)) return null;
-    const [index, latitude, longitude] = entry as unknown[];
-    const row = typeof index === "number" ? coverageRows[index] : undefined;
-    if (!row || typeof latitude !== "number" || typeof longitude !== "number") return null;
-    centers.push({ row, latitude, longitude });
-  }
-  // An empty catalog is not worth serving from cache and is cheap to rebuild, so treat it as a
-  // failed write rather than a real answer.
-  if (!data.bases.length) return null;
+  if (!Array.isArray(data.sites) || !Array.isArray(data.bases) || !Array.isArray(data.translations)) return null;
   const sites: Site[] = [];
   for (const packed of data.sites as unknown[]) {
     if (!Array.isArray(packed) || packed.length !== 8) return null;
@@ -850,7 +890,7 @@ function deserializeSnapshot(raw: unknown): DealsSnapshot | null {
     bases.push(base as DealBase);
   }
   for (const base of bases) {
-    if (!Array.isArray(base.chain_locations)) return null;
+    if (!Array.isArray(base.chain_locations) || typeof base.search_text !== "string") return null;
     const locations: NormalizedLocation[] = [];
     for (const entry of base.chain_locations as unknown[]) {
       if (Array.isArray(entry)) {
@@ -867,44 +907,34 @@ function deserializeSnapshot(raw: unknown): DealsSnapshot | null {
     base.participating_locations = locations.filter((location) => location.offer_available);
     base.other_brand_locations = locations.filter((location) => !location.offer_available);
   }
-  const brands = new Map<string, BrandIndex>();
-  for (const entry of data.brands as Array<[string, PackedBranch[]]>) {
-    if (!Array.isArray(entry) || typeof entry[0] !== "string" || !Array.isArray(entry[1])) return null;
-    brands.set(entry[0], indexBrand(entry[1].map((packed) => unpackBranch(entry[0], packed))));
-  }
-  // A deal pointing at a brand the payload does not carry would render with no branches at all.
-  for (const base of bases) if (base.brand_ref && !brands.has(base.brand_ref)) return null;
   return {
+    key,
     bases,
-    brands,
-    coverageRows,
     translationsByDeal: new Map(data.translations as Array<[string, Partial<Record<SupportedLocale, DealTranslationRow>>]>),
-    aliases: new Map(data.aliases as Array<[string, string]>),
-    centers,
     expiresAt: data.expiresAt,
-    revision: typeof data.revision === "string" ? data.revision : "",
+    revision,
   };
 }
 
 /** The fixed-name copy, read only when the revision could not be learned. See snapshotFallbackKey. */
-async function readFallbackSnapshot(origin: string): Promise<DealsSnapshot | null> {
+async function readFallbackSnapshot(origin: string, key: string): Promise<Stored | null> {
   const cache = snapshotCache();
   if (!cache) return null;
   try {
-    const hit = await cache.match(snapshotFallbackKey(origin));
-    return hit ? deserializeSnapshot(await hit.json()) : null;
+    const hit = await cache.match(snapshotFallbackKey(origin, key));
+    return hit ? deserializeSnapshot(await hit.json(), key) : null;
   } catch {
     return null;
   }
 }
 
-async function readSharedSnapshot(origin: string, revision: string): Promise<DealsSnapshot | null> {
+async function readSharedSnapshot(origin: string, key: string, revision: string): Promise<Stored | null> {
   const cache = snapshotCache();
   if (!cache) return null;
   try {
-    const hit = await cache.match(snapshotCacheKey(origin, revision));
+    const hit = await cache.match(snapshotCacheKey(origin, key, revision));
     if (!hit) return null;
-    return deserializeSnapshot(await hit.json());
+    return deserializeSnapshot(await hit.json(), key);
   } catch {
     // A torn or truncated entry is a miss, never an error the visitor sees.
     return null;
@@ -914,21 +944,21 @@ async function readSharedSnapshot(origin: string, revision: string): Promise<Dea
 // Never awaited by the request that triggered the build: the visitor is owed the deals, not the
 // bookkeeping. waitUntil keeps the isolate alive for it where there is a request context to hang
 // it on, and its absence is not worth failing over.
-function writeSharedSnapshot(origin: string, snapshot: DealsSnapshot) {
+function writeSharedSnapshot(origin: string, stored: Stored) {
   let serialized: string;
   try {
-    serialized = serializeSnapshot(snapshot);
+    serialized = serializeSnapshot(stored);
   } catch {
     return;
   }
-  const writes = [publishToColo(origin, snapshot.revision, serialized)];
+  const writes = [publishToColo(origin, stored.key, stored.revision, serialized)];
   const bucket = snapshotBucket();
-  // Only a snapshot that knows its revision: one built while the revision could not be read would
+  // Only a copy that knows its revision: one built while the revision could not be read would
   // match no reader's request here, and would displace one that does.
-  if (bucket && snapshot.revision) {
-    writes.push(bucket.put(SNAPSHOT_OBJECT_KEY, serialized, {
+  if (bucket && stored.revision) {
+    writes.push(bucket.put(snapshotObjectKey(stored.key), serialized, {
       httpMetadata: { contentType: "application/json" },
-      customMetadata: { revision: snapshot.revision },
+      customMetadata: { revision: stored.revision },
     }).catch(() => {}));
   }
   try {
@@ -938,7 +968,7 @@ function writeSharedSnapshot(origin: string, snapshot: DealsSnapshot) {
   }
 }
 
-function publishToColo(origin: string, revision: string, serialized: string): Promise<unknown> {
+function publishToColo(origin: string, key: string, revision: string, serialized: string): Promise<unknown> {
   const cache = snapshotCache();
   if (!cache) return Promise.resolve();
   const headers = { "content-type": "application/json", "cache-control": `max-age=${SNAPSHOT_CACHE_MAX_AGE_S}` };
@@ -946,32 +976,33 @@ function publishToColo(origin: string, revision: string, serialized: string): Pr
   // fixed name a cold isolate can build without asking D1 anything. A separate Response for each
   // because a body can only be consumed once.
   return Promise.all([
-    cache.put(snapshotCacheKey(origin, revision), new Response(serialized, { headers })).catch(() => {}),
-    cache.put(snapshotFallbackKey(origin), new Response(serialized, { headers })).catch(() => {}),
+    cache.put(snapshotCacheKey(origin, key, revision), new Response(serialized, { headers })).catch(() => {}),
+    cache.put(snapshotFallbackKey(origin, key), new Response(serialized, { headers })).catch(() => {}),
   ]);
 }
 
 // Across colos, through R2.
 //
 // The Cache API is per colo, so every revision used to be built from D1 once in each colo that
-// served a request after it: 27,984 rows a build on a copy of production, times however many
-// datacenters the traffic touched - a number that grows with the audience, not with the data. The
-// first colo to build a revision now writes it here as well, and every other colo reads it instead
-// of D1, so a change is built about once whatever the traffic.
+// served a request after it, times however many datacenters the traffic touched - a number that
+// grows with the audience, not with the data. The first colo to build a shard of a revision now
+// writes it here as well, and every other colo reads it instead of D1, so a change is built about
+// once whatever the traffic.
 //
-// One object, overwritten, holding its revision in its metadata; a reader after a different
-// revision leaves the body unread. Two colos building different revisions at the same moment can
-// leave the older one here, and the next reader after the newer one then misses, builds and
-// overwrites it: one extra build, never the wrong data, because a reader only takes the revision it
-// asked for.
+// One object per shard, overwritten, holding its revision in its metadata; a reader after a
+// different revision leaves the body unread. Two colos building different revisions at the same
+// moment can leave the older one here, and the next reader after the newer one then misses, builds
+// and overwrites it: one extra build, never the wrong data, because a reader only takes the
+// revision it asked for.
 //
-// In radar-photos, under a key app/api/photo will not serve (it answers image extensions only), in
-// a bucket with public access off: the object is reachable from this Worker and nowhere else.
+// In radar-photos, under keys app/api/photo will not serve (it answers image extensions only), in
+// a bucket with public access off: the objects are reachable from this Worker and nowhere else.
 //
 // It is also the last resort when D1 will not answer at all. A cold colo that cannot learn the
 // revision takes whatever is here, the way readFallbackSnapshot does within a colo, rather than
 // returning an error because the daily read allowance ran out.
-const SNAPSHOT_OBJECT_KEY = `internal/deals-snapshot/v${SNAPSHOT_CACHE_VERSION}/current`;
+const SNAPSHOT_OBJECT_KEY = `internal/deals-snapshot/v${SNAPSHOT_CACHE_VERSION}/`;
+const snapshotObjectKey = (key: string) => `${SNAPSHOT_OBJECT_KEY}${key}`;
 
 function snapshotBucket(): R2Bucket | null {
   try {
@@ -981,63 +1012,277 @@ function snapshotBucket(): R2Bucket | null {
   }
 }
 
-/** The shared copy of `revision`, or of whatever revision is there when `revision` is null. */
-async function readGlobalSnapshot(origin: string, revision: string | null): Promise<DealsSnapshot | null> {
+/** The shared copy of `key` at `revision`, or at whatever revision is there when `revision` is null. */
+async function readGlobalSnapshot(origin: string, key: string, revision: string | null): Promise<Stored | null> {
   const bucket = snapshotBucket();
   if (!bucket) return null;
   try {
-    const object = await bucket.get(SNAPSHOT_OBJECT_KEY);
+    const object = await bucket.get(snapshotObjectKey(key));
     if (!object) return null;
     if (revision !== null && object.customMetadata?.revision !== revision) {
       await object.body.cancel();
       return null;
     }
     const serialized = await object.text();
-    const snapshot = deserializeSnapshot(JSON.parse(serialized));
-    if (!snapshot) return null;
+    const stored = deserializeSnapshot(JSON.parse(serialized), key);
+    if (!stored) return null;
     // Into this colo as well, so its other isolates find it without going back to R2.
-    const publish = publishToColo(origin, snapshot.revision, serialized);
+    const publish = publishToColo(origin, key, stored.revision, serialized);
     try {
       waitUntil(publish);
     } catch {
       // No request context; the puts are already running.
     }
-    return snapshot;
+    return stored;
   } catch {
     // A torn object or a failed read is a miss, never an error the visitor sees.
     return null;
   }
 }
 
-async function buildSnapshot(): Promise<DealsSnapshot> {
-  // A deal a reader has reported as ended or wrong, and staff have not yet closed the report on:
-  // "Re-checking" to every client, and lower in the recommended order (app/accuracy-reports.ts).
+// Which shards a request is about.
+
+// A 1-degree grid: at the latitudes Radar covers a cell is 70-111 km across, so a 50 km radius is
+// never more than a few cells in any direction, and a dense metro is still only a few hundred deals.
+const cellKey = (latitude: number, longitude: number) => `cell:${Math.floor(latitude)}:${Math.floor(longitude)}`;
+const countryKey = (country: string) => `country:${country}`;
+const nationalKey = (country: string) => `national:${country}`;
+/** A country code a shard can be named for: two letters, else nothing. The request's own spelling is not a key. */
+const shardCountry = (value: string | null | undefined) => (value && /^[A-Z]{2}$/.test(value) ? value : null);
+
+/** Degrees of latitude and longitude that `km` spans at `latitude`; longitude never shorter than a fifth of a degree per 111 km. */
+function degreesAt(latitude: number, km: number) {
+  return { lat: km / 111, lng: km / (111 * Math.max(0.2, Math.cos((latitude * Math.PI) / 180))) };
+}
+
+/**
+ * The cells a search from `point` reaching `reachKm` touches: every cell its bounding box overlaps,
+ * the point's own first. First matters: a deal is read from the first cell it is found in, and the
+ * copy in the reader's own cell carries every branch a search from there can reach.
+ */
+function cellsWithin(point: { latitude: number; longitude: number }, reachKm: number): string[] {
+  const span = degreesAt(point.latitude, reachKm);
+  const keys = [cellKey(point.latitude, point.longitude)];
+  for (let lat = Math.floor(point.latitude - span.lat); lat <= Math.floor(point.latitude + span.lat); lat++) {
+    for (let lng = Math.floor(point.longitude - span.lng); lng <= Math.floor(point.longitude + span.lng); lng++) {
+      const key = `cell:${lat}:${lng}`;
+      if (!keys.includes(key)) keys.push(key);
+    }
+  }
+  return keys;
+}
+
+/** What a shard holds, read off its key; null for a key no shard is built for. */
+type ShardSpec =
+  | { kind: "cell"; south: number; north: number; west: number; east: number }
+  | { kind: "country"; country: string }
+  | { kind: "national"; country: string }
+  | { kind: "ids"; ids: string[]; point: { latitude: number; longitude: number } | null };
+
+function shardSpec(key: string): ShardSpec | null {
+  const cell = /^cell:(-?\d+):(-?\d+)$/.exec(key);
+  if (cell) {
+    const lat = Number(cell[1]), lng = Number(cell[2]);
+    if (lat < -90 || lat > 89 || lng < -180 || lng > 179) return null;
+    return { kind: "cell", south: lat, north: lat + 1, west: lng, east: lng + 1 };
+  }
+  const country = /^(country|national):([A-Z]{2})$/.exec(key);
+  if (country) return { kind: country[1] as "country" | "national", country: country[2] };
+  return null;
+}
+
+/** A bounding box as the four binds a `BETWEEN ? AND ?` pair reads, with a hard bound on latitude. */
+const boxBinds = (south: number, north: number, west: number, east: number) =>
+  [Math.max(-90, south), Math.min(90, north), Math.max(-180, west), Math.min(180, east)];
+
+/** `IN (SELECT value FROM json_each(?))`: a list of any length as one bound parameter, since D1 allows a hundred. */
+const inList = (values: readonly string[]) => JSON.stringify(values);
+const IN_LIST = "IN (SELECT value FROM json_each(?))";
+
+async function buildSnapshot(key: string): Promise<Stored> {
+  if (key === META_KEY) return buildMeta();
+  const spec = shardSpec(key);
+  if (!spec) throw new Error(`no such deals shard: ${key}`);
+  return buildShard(key, spec);
+}
+
+// The columns every shard's deals carry; `SELECT d.*` first, so the deals table's own columns lead
+// the row in the table's order (tests/snapshot-rows.test.mjs).
+//
+// A deal a reader has reported as ended or wrong, and staff have not yet closed the report on:
+// "Re-checking" to every client, and lower in the recommended order (app/accuracy-reports.ts).
+//
+// confirmed_rows and own_confirmed are the two halves of how many branches run a per-branch deal
+// (see eligibilityAt): its confirmed deal_locations rows, and whether the branch at its own address
+// counts by default, having no row of its own. Both are answered from an index, a few rows a deal.
+// A brand-wide deal runs at every branch, and a nationwide one at none that Radar holds.
+const DEAL_COLUMNS = () => {
   const underReview = underReviewSql("d");
-  const select = `SELECT d.*,COALESCE(r.name,d.restaurant) canonical_restaurant,r.website restaurant_website,r.photo_url restaurant_photo_url,r.logo_url restaurant_logo_url,r.country restaurant_country,r.footprint restaurant_footprint,r.locator_url restaurant_locator_url,r.phone restaurant_phone,r.amenities,r.dietary_options,r.accessibility,r.id canonical_restaurant_id,r.is_chain,r.hidden_gem,r.national_chain,r.brand,r.service_style,COALESCE(r.vertical,'restaurant') vertical,l.latitude,l.longitude,l.timezone,l.country,l.region,l.id eligible_location_id,l.neighborhood,l.official_url location_website,s.days schedule_days,s.start_time,s.end_time,s.recurring,(SELECT COUNT(*) FROM favorites f WHERE f.deal_id=d.id) save_count,CASE WHEN ${underReview} THEN 'stale' WHEN d.verification_status='verified' AND julianday('now')-julianday(d.verified_at)>30 THEN 'stale' ELSE d.verification_status END effective_verification_status,${underReview} under_review FROM deals d LEFT JOIN restaurants r ON r.id=d.restaurant_id LEFT JOIN restaurant_locations l ON l.id=d.location_id LEFT JOIN deal_schedules s ON s.id=(SELECT id FROM deal_schedules WHERE deal_id=d.id ORDER BY id LIMIT 1) WHERE ${publicDealPredicate}`;
+  return `d.*,COALESCE(r.name,d.restaurant) canonical_restaurant,r.website restaurant_website,r.photo_url restaurant_photo_url,r.logo_url restaurant_logo_url,r.country restaurant_country,r.footprint restaurant_footprint,r.locator_url restaurant_locator_url,r.phone restaurant_phone,r.amenities,r.dietary_options,r.accessibility,r.id canonical_restaurant_id,r.is_chain,r.hidden_gem,r.national_chain,r.brand,r.service_style,COALESCE(r.vertical,'restaurant') vertical,l.latitude,l.longitude,l.timezone,l.country,l.region,l.id eligible_location_id,l.neighborhood,l.official_url location_website,s.days schedule_days,s.start_time,s.end_time,s.recurring,(SELECT COUNT(*) FROM favorites f WHERE f.deal_id=d.id) save_count,CASE WHEN ${underReview} THEN 'stale' WHEN d.verification_status='verified' AND julianday('now')-julianday(d.verified_at)>30 THEN 'stale' ELSE d.verification_status END effective_verification_status,${underReview} under_review,(SELECT COUNT(*) FROM deal_locations dl WHERE dl.deal_id=d.id AND dl.eligibility='confirmed') confirmed_rows,EXISTS(SELECT 1 FROM restaurant_locations x WHERE x.restaurant_id=d.restaurant_id AND x.address=d.address AND x.status='operating' AND NOT EXISTS(SELECT 1 FROM deal_locations dl WHERE dl.deal_id=d.id AND dl.location_id=x.id)) own_confirmed`;
+};
+const DEAL_FROM = "FROM deals d LEFT JOIN restaurants r ON r.id=d.restaurant_id LEFT JOIN restaurant_locations l ON l.id=d.location_id LEFT JOIN deal_schedules s ON s.id=(SELECT id FROM deal_schedules WHERE deal_id=d.id ORDER BY id LIMIT 1)";
+const DEAL_ORDER = "ORDER BY d.sponsored DESC,d.verified_at DESC,d.restaurant";
+
+/**
+ * The branches of `restaurants` an operating branch each, as a shard carries them: `where` narrows
+ * them (a bounding box, or a sample per region), and the deals' own branches come whatever it says.
+ */
+const BRANCH_COLUMNS = "l.id location_id,l.restaurant_id,l.address,l.city,l.region,l.country,l.postal_prefix,l.latitude,l.longitude,l.official_url,CASE WHEN l.geo_precision='city' THEN 1 ELSE 0 END approximate";
+
+/**
+ * Several statements as one D1 batch, each answered in its place; a null is a statement not worth
+ * sending, answered empty. One subrequest for all of them - see where buildShard reads.
+ */
+async function batched<T extends unknown[]>(statements: Array<D1PreparedStatement | null>): Promise<{ [K in keyof T]: D1Result<T[K]> }> {
+  const sent = statements.filter((statement): statement is D1PreparedStatement => statement !== null);
+  const answers = sent.length ? await env.DB.batch(sent) : [];
+  let next = 0;
+  return statements.map((statement) => (statement ? answers[next++] : { results: [], success: true, meta: {} })) as { [K in keyof T]: D1Result<T[K]> };
+}
+
+/** The deals of one shard and everything they refer to, read from D1 and built. */
+async function buildShard(key: string, spec: ShardSpec): Promise<DealsShard> {
   // Read alongside the rest, not before it: taken after the reads, a write landing mid-build would
   // be stamped as already included and the next revision check would see nothing to do. Taken with
   // them, the worst case is a revision older than the rows, which costs one extra rebuild and
   // cannot lose a change.
-  //
-  // Branches and eligibility are read separately rather than as one deals x branches join. The join
-  // returned a row per deal per branch of its brand - 22,981 of them, 91,642 rows read a build - so
-  // a brand's branches were read once for every deal it ran, and a second McDonald's deal would have
-  // read all 10,482 of them again. Now every branch is read once, and deal_locations only for the
-  // deals that still decide per branch: a 'brand' deal runs everywhere and its rows are not needed.
-  //
-  // A chain whose every public deal is 'national' is placed by its footprint, not its branches, so
-  // neither its branches nor its eligibility rows are read at all. The largest national chains
-  // still have thousands of harvested branches in D1; carried into the snapshot they were nearly
-  // half of what every cold isolate had to parse before answering, more CPU than a request is
-  // allowed.
-  const [revision, publicRows, terms, branchRows, eligibilityRows, coverageRows, translationRows, aliasRows] = await Promise.all([
+  const select = `SELECT ${DEAL_COLUMNS()} ${DEAL_FROM} WHERE ${publicDealPredicate}`;
+  let dealsRead: D1PreparedStatement;
+  if (spec.kind === "cell") {
+    // A deal is in a cell when it is confirmed at a branch inside it: at its own branch, at every
+    // branch of its chain for a brand-wide deal, or at one its deal_locations rows confirm. The
+    // branches in the cell are found first, by the (latitude, longitude) index (drizzle/0139), and
+    // each test below is a lookup against that small set.
+    const box = boxBinds(spec.south, spec.north, spec.west, spec.east);
+    dealsRead = env.DB.prepare(
+      `WITH here AS (SELECT id,restaurant_id FROM restaurant_locations WHERE status='operating' AND latitude BETWEEN ? AND ? AND longitude BETWEEN ? AND ?) ${select} AND d.location_scope IS NOT 'national' AND (d.location_id IN (SELECT id FROM here) OR (d.location_scope='brand' AND d.restaurant_id IN (SELECT restaurant_id FROM here)) OR d.id IN (SELECT dl.deal_id FROM deal_locations dl WHERE dl.eligibility='confirmed' AND dl.location_id IN (SELECT id FROM here))) ${DEAL_ORDER}`,
+    ).bind(...box);
+  } else if (spec.kind === "country") {
+    dealsRead = env.DB.prepare(`${select} AND d.location_scope IS NOT 'national' AND l.country=? ${DEAL_ORDER}`).bind(spec.country);
+  } else if (spec.kind === "national") {
+    dealsRead = env.DB.prepare(`${select} AND d.location_scope='national' AND r.country=? ${DEAL_ORDER}`).bind(spec.country);
+  } else {
+    const list = inList(spec.ids);
+    dealsRead = env.DB.prepare(`${select} AND (d.id ${IN_LIST} OR d.slug ${IN_LIST}) ${DEAL_ORDER}`).bind(list, list);
+  }
+  const [revision, publicRows] = await Promise.all([readRevision(), dealsRead.all<DealRow>()]);
+  const rows = publicRows.results;
+  const dealIds = rows.map((row) => row.id);
+  const restaurantIds = [...new Set(rows.flatMap((row) => (row.restaurant_id && row.location_scope !== "national" ? [row.restaurant_id] : [])))];
+  const ownIds = [...new Set(rows.flatMap((row) => (row.location_id && row.location_scope !== "national" ? [row.location_id] : [])))];
+  // The deals that still decide per branch: a 'brand' deal runs everywhere and its rows are not
+  // needed, and a 'national' one has no branches at all.
+  const perBranchIds = rows.filter((row) => !["brand", "national"].includes(String(row.location_scope || ""))).map((row) => row.id);
+
+  // The branches each deal carries - see DealsShard for what each kind holds.
+  let branchesRead: D1PreparedStatement | null;
+  if (!restaurantIds.length) {
+    branchesRead = null;
+  } else if (spec.kind === "cell" || (spec.kind === "ids" && spec.point)) {
+    const reach = spec.kind === "cell"
+      ? { south: spec.south, north: spec.north, west: spec.west, east: spec.east, latitude: (spec.south + spec.north) / 2 }
+      : { south: spec.point!.latitude, north: spec.point!.latitude, west: spec.point!.longitude, east: spec.point!.longitude, latitude: spec.point!.latitude };
+    const span = degreesAt(reach.latitude, CELL_BRANCH_REACH_KM);
+    branchesRead = env.DB.prepare(
+      `SELECT ${BRANCH_COLUMNS} FROM restaurant_locations l WHERE l.status='operating' AND l.restaurant_id ${IN_LIST} AND ((l.latitude BETWEEN ? AND ? AND l.longitude BETWEEN ? AND ?) OR l.id ${IN_LIST})`,
+    ).bind(inList(restaurantIds), ...boxBinds(reach.south - span.lat, reach.north + span.lat, reach.west - span.lng, reach.east + span.lng), inList(ownIds));
+  } else {
+    branchesRead = env.DB.prepare(
+      `SELECT ${BRANCH_COLUMNS} FROM (SELECT l.*,ROW_NUMBER() OVER (PARTITION BY l.restaurant_id,l.region ORDER BY l.id) sampled FROM restaurant_locations l WHERE l.status='operating' AND l.restaurant_id ${IN_LIST}) l WHERE l.sampled<=? OR l.id ${IN_LIST}`,
+    ).bind(inList(restaurantIds), BRANCHES_PER_REGION, inList(ownIds));
+  }
+  // As one batch: one subrequest of the fifty a request has, where five statements would be five.
+  // An empty list reads nothing - a statement that would match nothing is not sent.
+  const empty = <T>(): D1Result<T> => ({ results: [] as T[], success: true, meta: {} } as unknown as D1Result<T>);
+  const [branchRows, eligibilityRows, terms, translationRows, totalRows] = dealIds.length
+    ? await batched<[BranchRow, EligibilityRow, SearchTermRow, DealTranslationRow, { restaurant_id: string; n: number }]>([
+      branchesRead,
+      perBranchIds.length
+        ? env.DB.prepare(`SELECT dl.deal_id,dl.location_id,dl.eligibility,dl.source_url FROM deal_locations dl WHERE dl.deal_id ${IN_LIST}`).bind(inList(perBranchIds))
+        : null,
+      env.DB.prepare(`SELECT entity_type,entity_id,term,weight FROM search_terms WHERE (entity_type='deal' AND entity_id ${IN_LIST}) OR (entity_type='restaurant' AND entity_id ${IN_LIST})`).bind(inList(dealIds), inList(restaurantIds)),
+      env.DB.prepare(`SELECT deal_id,locale,title,description,schedule,price,terms,restrictions FROM deal_translations WHERE deal_id ${IN_LIST}`).bind(inList(dealIds)),
+      // How many branches each chain has in all, counted over every one of them: what a card says
+      // beside the few branches it carries.
+      restaurantIds.length
+        ? env.DB.prepare(`SELECT restaurant_id,COUNT(*) n FROM restaurant_locations WHERE status='operating' AND restaurant_id ${IN_LIST} GROUP BY restaurant_id`).bind(inList(restaurantIds))
+        : null,
+    ])
+    : [empty<BranchRow>(), empty<EligibilityRow>(), empty<SearchTermRow>(), empty<DealTranslationRow>(), empty<{ restaurant_id: string; n: number }>()];
+  const termsByDeal = terms.results.reduce((map, row) => {
+    const key = `${row.entity_type}:${row.entity_id}`, list = map.get(key) || [];
+    list.push({ term: foldSearch(String(row.term || "")), weight: row.weight });
+    map.set(key, list);
+    return map;
+  }, new Map<string, Array<{ term: string; weight: number }>>());
+  const translationsByDeal = translationRows.results.reduce((map, row) => {
+    if (!isSupportedLocale(row.locale)) return map;
+    const byLocale = map.get(row.deal_id) || {}; byLocale[row.locale] = row; map.set(row.deal_id, byLocale); return map;
+  }, new Map<string, Partial<Record<SupportedLocale, DealTranslationRow>>>());
+  const branchTotals = new Map(totalRows.results.map((row) => [row.restaurant_id, Number(row.n)]));
+  const bases = buildBases(rows.map(normalizePlace), branchRows.results.map(normalizePlace), eligibilityRows.results, termsByDeal, branchTotals);
+  return { key, bases, translationsByDeal, expiresAt: Date.now() + SNAPSHOT_TTL_MS, revision };
+}
+
+// City and region are normalized here, at the edge of the snapshot, rather than at each of the
+// places that reads one.
+//
+// A city with a province or state still stuck on the end ("Austin, TX") is a second entry in
+// `facets.cities`, a second suggestion in the app's place picker, and a second unit in the
+// homepage's "N cities" count, even though it is the same city as the bare name beside it. A
+// region written out in full ("Texas") is invisible to the `province=TX` filter below, which
+// compares the two strings directly.
+//
+// Neither is written by the code any more — the deals editor strips a city suffix, the
+// geocoders reduce a region to its code, and 0033 cleaned out the rows that had either — but
+// that code is not the only way a row gets in. The seed scripts, the suggestion conversion, and
+// a staff member with a SQL console all write these columns too. Doing it once on the way out
+// means no later reader has to remember to. A null region stays null: the filter and the
+// response already treat that as "not recorded", which is different from a blank string.
+const normalizePlace = <T extends { city: string; region?: string | null }>(row: T) => ({
+  ...row, city: canonicalCity(row.city), region: row.region ? regionCode(row.region) : row.region,
+});
+
+/** What the meta shard is built from: one slim row per public deal. */
+interface MetaRow {
+  id: string;
+  city: string;
+  address: string;
+  restaurant_id: string | null;
+  location_scope: string | null;
+  verification_status: string;
+  verified_at: string | null;
+  restaurant: string;
+  title: string;
+  price: string;
+  description: string | null;
+  category: string;
+  cuisine: string;
+  terms: string | null;
+  restrictions: string | null;
+  schedule: string;
+  canonical_restaurant_id: string | null;
+  is_chain: number | null;
+  national_chain: number | null;
+  restaurant_country: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  region: string | null;
+  country: string | null;
+}
+
+/**
+ * The shard every request reads: markets, aliases, countries and the catalogue's counts. One slim
+ * row per public deal - the columns the counts and the market centres need, two dozen of the
+ * hundred a shard's deals carry - and nothing per branch.
+ */
+async function buildMeta(): Promise<DealsMeta> {
+  const [revision, rows, coverageRows, aliasRows] = await Promise.all([
     readRevision(),
-    env.DB.prepare(`${select} ORDER BY d.sponsored DESC,d.verified_at DESC,d.restaurant`).all<DealRow>(),
-    env.DB.prepare("SELECT entity_type,entity_id,term,weight FROM search_terms WHERE entity_type IN ('deal','restaurant')").all<SearchTermRow>(),
-    env.DB.prepare(`SELECT l.id location_id,l.restaurant_id,l.address,l.city,l.region,l.country,l.postal_prefix,l.latitude,l.longitude,l.official_url,CASE WHEN l.geo_precision='city' THEN 1 ELSE 0 END approximate FROM restaurant_locations l WHERE l.status='operating' AND l.restaurant_id IN (SELECT d.restaurant_id FROM deals d WHERE ${publicDealPredicate} AND d.restaurant_id IS NOT NULL AND d.location_scope IS NOT 'national')`).all<BranchRow>(),
-    env.DB.prepare(`SELECT dl.deal_id,dl.location_id,dl.eligibility,dl.source_url FROM deals d JOIN deal_locations dl ON dl.deal_id=d.id WHERE ${publicDealPredicate} AND COALESCE(d.location_scope,'') NOT IN ('brand','national')`).all<EligibilityRow>(),
+    env.DB.prepare(
+      `SELECT d.id,d.city,d.address,d.restaurant_id,d.location_scope,d.verification_status,d.verified_at,COALESCE(r.name,d.restaurant) restaurant,d.title,d.price,d.description,d.category,d.cuisine,d.terms,d.restrictions,d.schedule,r.id canonical_restaurant_id,r.is_chain,r.national_chain,r.country restaurant_country,l.latitude,l.longitude,l.region,l.country FROM deals d LEFT JOIN restaurants r ON r.id=d.restaurant_id LEFT JOIN restaurant_locations l ON l.id=d.location_id WHERE ${publicDealPredicate}`,
+    ).all<MetaRow>(),
     env.DB.prepare("SELECT * FROM market_coverage").all<MarketCoverageRow>(),
-    env.DB.prepare("SELECT deal_id,locale,title,description,schedule,price,terms,restrictions FROM deal_translations").all<DealTranslationRow>(),
     env.DB.prepare("SELECT alias_id,canonical_deal_id FROM deal_aliases").all<{ alias_id: string; canonical_deal_id: string }>(),
   ]);
   // Followed to the end, so a duplicate folded into a deal that was itself folded later still finds
@@ -1049,87 +1294,57 @@ async function buildSnapshot(): Promise<DealsSnapshot> {
     for (let hop = 0; hop < 5 && aliasTargets.has(target); hop++) target = aliasTargets.get(target)!;
     if (target !== alias) aliases.set(alias, target);
   }
-  const termsByDeal = terms.results.reduce((map, row) => {
-    const key = `${row.entity_type}:${row.entity_id}`,list = map.get(key) || []; list.push({ term: row.term, weight: row.weight }); map.set(key,list); return map;
-  }, new Map<string, Array<{term:string;weight:number}>>());
-  const translationsByDeal = translationRows.results.reduce((map, row) => {
-    if (!isSupportedLocale(row.locale)) return map;
-    const byLocale = map.get(row.deal_id) || {}; byLocale[row.locale] = row; map.set(row.deal_id,byLocale); return map;
-  }, new Map<string, Partial<Record<SupportedLocale, DealTranslationRow>>>());
-  // City and region are normalized here, at the edge of the snapshot, rather than at each of the
-  // places that reads one.
-  //
-  // A city with a province or state still stuck on the end ("Austin, TX") is a second entry in
-  // `facets.cities`, a second suggestion in the app's place picker, and a second unit in the
-  // homepage's "N cities" count, even though it is the same city as the bare name beside it. A
-  // region written out in full ("Texas") is invisible to the `province=TX` filter below, which
-  // compares the two strings directly.
-  //
-  // Neither is written by the code any more — the deals editor strips a city suffix, the
-  // geocoders reduce a region to its code, and 0033 cleaned out the rows that had either — but
-  // that code is not the only way a row gets in. The seed scripts, the suggestion conversion, and
-  // a staff member with a SQL console all write these columns too. Doing it once on the way out
-  // means no later reader has to remember to. A null region stays null: the filter and the
-  // response already treat that as "not recorded", which is different from a blank string.
-  const normalize = <T extends { city: string; region?: string | null }>(row: T) => ({
-    ...row, city: canonicalCity(row.city), region: row.region ? regionCode(row.region) : row.region,
-  });
-  const normalizedPublicRows = publicRows.results.map(normalize);
-  const normalizedBranchRows = branchRows.results.map(normalize);
-  const { bases, brands } = buildBases(normalizedPublicRows, normalizedBranchRows, eligibilityRows.results, termsByDeal);
-  const centers = marketCenters(coverageRows.results, bases);
-  return { bases, brands, coverageRows: coverageRows.results, translationsByDeal, aliases, centers, expiresAt: Date.now() + SNAPSHOT_TTL_MS, revision };
-}
+  const places = rows.results.map(normalizePlace);
+  const countries = [...new Set(places.flatMap((row) => {
+    const country = shardCountry(String((row.location_scope === "national" ? row.restaurant_country : row.country) || "").toUpperCase());
+    return country ? [country] : [];
+  }))].sort();
 
-// A 1-degree grid: at the latitudes Radar covers a cell is 70-111 km across, so a 50 km radius is
-// never more than a few cells in any direction, and a dense metro is still only a few hundred
-// branches of one brand per cell.
-const cellKey = (latitude: number, longitude: number) => `${Math.floor(latitude)}:${Math.floor(longitude)}`;
-
-/** The lookups a request needs from a large brand's branches, built once per snapshot. */
-function indexBrand(branches: BranchRow[]): BrandIndex {
-  const byId = new Map<string, BranchRow>();
-  const byRegion = new Map<string, BranchRow[]>();
-  const cells = new Map<string, BranchRow[]>();
-  for (const branch of branches) {
-    byId.set(branch.location_id, branch);
-    if (branch.region) {
-      const key = branch.region.toUpperCase(), list = byRegion.get(key);
-      if (list) list.push(branch); else byRegion.set(key, [branch]);
-    }
-    if (branch.latitude != null && branch.longitude != null) {
-      const key = cellKey(Number(branch.latitude), Number(branch.longitude)), list = cells.get(key);
-      if (list) list.push(branch); else cells.set(key, [branch]);
-    }
+  // The newest source check, which the results header prints as "Latest source check". Taken over
+  // every public deal, and only from the deals a check was actually recorded on - verified ones,
+  // including those gone stale since, whose date is still a real check. A needs_review deal's
+  // verified_at is only the moment it was imported.
+  let latestSourceCheck: string | null = null, latestMs = -Infinity;
+  for (const row of places) {
+    if (row.verification_status !== "verified" && row.verification_status !== "stale") continue;
+    const at = row.verified_at ? parseSqlTimestamp(row.verified_at).getTime() : NaN;
+    if (Number.isFinite(at) && at > latestMs) { latestMs = at; latestSourceCheck = row.verified_at; }
   }
-  return { branches, byId, byRegion, cells };
+  return {
+    key: META_KEY,
+    coverageRows: coverageRows.results,
+    centers: marketCenters(coverageRows.results, places),
+    aliases,
+    countries,
+    counts: { all: catalogCounts(places, false), separate: catalogCounts(places, true) },
+    latestSourceCheck,
+    expiresAt: Date.now() + SNAPSHOT_TTL_MS,
+    revision,
+  };
 }
 
 /**
- * The branches of a large brand a request about `point` needs: every one within the radius, nearest
- * first, up to `max`; and when fewer than `min` are in range, the nearest beyond it as well, so the
- * card's list of other locations is not left with two entries when a reader stands at the edge of a
- * metro. Only the grid cells the radius can reach are measured.
+ * The homepage's "N restaurants · M cities", counted over the whole catalogue the way the local list
+ * groups it: one card per chain, one per address of an independent, before any filter or place
+ * narrows them, so the hero and the list's own "N matches" count one thing. A request answered from
+ * one cell cannot count the rest, so the counts travel in the meta shard.
+ *
+ * Cities are the offers' own, not the cards' (a card's city moves to whichever branch is nearest
+ * the reader), and `foodCities` leaves out a city whose every listing names a drink: a reader who
+ * has hidden drinks sees neither the listings nor the city. A nationwide promotion has no city and
+ * is in no city's count; with national chains in a section of their own (chains=separate), their
+ * branch deals are out of the local list and out of both counts.
  */
-function nearestBranches(index: BrandIndex, point: { latitude: number; longitude: number }, radiusKm: number, min: number, max: number): BranchRow[] {
-  const measure = (reachKm: number) => {
-    const latSpan = Math.ceil(reachKm / 111) + 1;
-    const lonSpan = Math.ceil(reachKm / (111 * Math.max(0.2, Math.cos((point.latitude * Math.PI) / 180)))) + 1;
-    const lat0 = Math.floor(point.latitude), lon0 = Math.floor(point.longitude);
-    const found: Array<{ branch: BranchRow; km: number }> = [];
-    for (let lat = lat0 - latSpan; lat <= lat0 + latSpan; lat++) {
-      for (let lon = lon0 - lonSpan; lon <= lon0 + lonSpan; lon++) {
-        for (const branch of index.cells.get(`${lat}:${lon}`) || []) {
-          const km = kmBetween(point, { latitude: Number(branch.latitude), longitude: Number(branch.longitude) });
-          if (km <= reachKm) found.push({ branch, km });
-        }
-      }
-    }
-    return found.sort((a, b) => a.km - b.km);
-  };
-  let found = measure(radiusKm);
-  if (found.length < min) found = measure(Math.max(radiusKm * 3, 150)).slice(0, Math.max(min, found.length));
-  return found.slice(0, max).map((entry) => entry.branch);
+function catalogCounts(rows: readonly MetaRow[], chainsSeparate: boolean): CountSet {
+  const cards = new Set<string>(), cities = new Set<string>(), foodCities = new Set<string>();
+  for (const row of rows) {
+    if (row.location_scope === "national" || (chainsSeparate && row.national_chain)) continue;
+    cards.add(!row.canonical_restaurant_id ? row.id : row.is_chain ? row.canonical_restaurant_id : `${row.canonical_restaurant_id}|${row.address}`);
+    if (!row.city) continue;
+    cities.add(row.city);
+    if (!foodCities.has(row.city) && !referencesAlcohol(row)) foodCities.add(row.city);
+  }
+  return { cards: cards.size, cities: cities.size, foodCities: foodCities.size };
 }
 
 /**
@@ -1175,13 +1390,14 @@ function eligibilityAt(
   return [branch.address === deal.address ? "confirmed" : "unconfirmed", null];
 }
 
-/** The visitor-independent half of each deal, derived once per snapshot. */
+/** The visitor-independent half of each deal, derived once per shard. */
 function buildBases(
   publicRows: DealRow[],
   branchRows: BranchRow[],
   eligibilityRows: EligibilityRow[],
   termsByDeal: Map<string, Array<{ term: string; weight: number }>>,
-): { bases: DealBase[]; brands: Map<string, BrandIndex> } {
+  branchTotals: Map<string, number>,
+): DealBase[] {
   // Pre-bucketed once instead of re-scanned per deal, which was an O(deals × locations) pass.
   const branchesByRestaurant = branchRows.reduce((map, row) => {
     const list = map.get(row.restaurant_id); if (list) list.push(row); else map.set(row.restaurant_id,[row]); return map;
@@ -1190,14 +1406,14 @@ function buildBases(
     const byLocation = map.get(row.deal_id) || new Map<string, readonly [string, string | null]>();
     byLocation.set(row.location_id, [row.eligibility, row.source_url] as const); map.set(row.deal_id, byLocation); return map;
   }, new Map<string, Map<string, readonly [string, string | null]>>());
-  const brands = new Map<string, BrandIndex>();
-  for (const [restaurantId, list] of branchesByRestaurant) {
-    if (list.length > LARGE_BRAND_MIN_BRANCHES) brands.set(restaurantId, indexBrand(list));
-  }
 
-  const bases = publicRows.map((deal): DealBase => {
+  return publicRows.map((row): DealBase => {
+    // The two counts are the shard's measurement, not fields of the deal; they are read here and
+    // become chain_location_count and participating_location_count below.
+    const { confirmed_rows, own_confirmed, ...deal } = row;
     const normalizedRestaurant = deal.canonical_restaurant || deal.restaurant;
     const indexed = [...(termsByDeal.get(`deal:${deal.id}`) || []),...(termsByDeal.get(`restaurant:${deal.canonical_restaurant_id}`) || [])];
+    const search_keywords = `${searchKeywords(deal)} ${indexed.map((item) => item.term).join(" ")}`;
     const common = {
       ...deal,
       restaurant: normalizedRestaurant,
@@ -1207,17 +1423,15 @@ function buildBases(
       national_chain: !!deal.national_chain,
       hidden_gem: !!deal.hidden_gem,
       chain_brand: normalizedRestaurant,
-      search_keywords: `${searchKeywords(deal)} ${indexed.map((item) => item.term).join(" ")}`,
+      search_keywords,
       price_tier: narrowPriceTier(deal.price_tier) ?? estimatePriceTier(deal.price),
       indexed,
       // Staff notes are never read past this point, and the snapshot is stored outside the
       // database. Overwritten rather than left out, so the field keeps its place in a row.
       internal_notes: null,
+      // What a keyword search reads of the deal, normalized once - see DealBase.search_text.
+      search_text: foldSearch(`${search_keywords} ${normalizedRestaurant} ${deal.title} ${deal.schedule} ${deal.price}`),
     };
-    // Every restaurant_locations row sharing this deal's restaurant_id is a real location — no
-    // guessing chain membership from a regex on the name. A restaurant with one location comes
-    // back with exactly one row, so this is also the single-location path; the empty-array
-    // fallback only fires for a deal with no restaurant_id at all.
     // A national deal has no location and no branches: its brand row says which country it is in
     // and which regions it trades in, and a request places it by those. See drizzle/0050.
     if (deal.location_scope === "national") {
@@ -1233,174 +1447,188 @@ function buildBases(
       };
     }
 
+    // Every restaurant_locations row sharing this deal's restaurant_id is a real location — no
+    // guessing chain membership from a regex on the name. A restaurant with one location comes
+    // back with exactly one row, so this is also the single-location path; the empty-array
+    // fallback only fires for a deal with no restaurant_id at all, or whose chain has no branch in
+    // reach of this shard.
     const branches = (deal.restaurant_id && branchesByRestaurant.get(deal.restaurant_id)) || [];
     const explicit = eligibilityByDeal.get(deal.id);
-
-    // A large brand: the totals are measured here, and the branches themselves are drawn per
-    // request from `brands`, so the snapshot holds them once however many deals the brand runs.
-    if (deal.restaurant_id && brands.has(deal.restaurant_id)) {
-      let participating = 0;
-      for (const branch of branches) if (eligibilityAt(deal, explicit, branch)[0] === "confirmed") participating++;
-      return {
-        ...common,
-        brand_ref: deal.restaurant_id,
-        chain_location_count: branches.length,
-        participating_location_count: participating,
-        ...(deal.location_scope !== "brand" && explicit
-          ? { location_eligibility: Object.fromEntries([...explicit].map(([id, row]) => [id, [row[0], row[1]]])) as Record<string, [string, string | null]> }
-          : {}),
-        chain_locations: [],
-        participating_locations: [],
-        other_brand_locations: [],
-      };
-    }
-
     const locations: NormalizedLocation[] = branches.length
       ? branches.map((branch) => { const [eligibility, source] = eligibilityAt(deal, explicit, branch); return locationOf(branch, eligibility, source, deal); })
       : [{ city: deal.city, address: deal.address, postal_prefix: deal.postal_prefix, region: deal.region, source_url: deal.source_url, latitude: deal.latitude, longitude: deal.longitude, location_id: deal.eligible_location_id, eligibility: "confirmed", offer_available: true }];
+    const participating = locations.filter((location) => location.offer_available);
+    // The totals are measured over every branch of the chain, however many this shard carries: the
+    // chain's branches in all, and the ones that run the offer - all of them for a brand-wide deal,
+    // else its confirmed rows plus its own address where no row says otherwise. Never fewer than
+    // the shard itself holds.
+    const total = (deal.restaurant_id && branchTotals.get(deal.restaurant_id)) || 0;
+    const confirmed = deal.location_scope === "brand" ? total : Number(confirmed_rows || 0) + (own_confirmed ? 1 : 0);
     return {
       ...common,
-      chain_location_count: locations.length,
+      chain_location_count: Math.max(total, locations.length),
+      participating_location_count: Math.max(confirmed, participating.length),
       chain_locations: locations,
-      participating_locations: locations.filter((location) => location.offer_available),
+      participating_locations: participating,
       other_brand_locations: locations.filter((location) => !location.offer_available),
     };
   });
-  return { bases, brands };
 }
 
-function refreshSnapshot(cacheOrigin: string): Promise<DealsSnapshot> {
-  if (snapshotInFlight && Date.now() - snapshotStartedAt < SNAPSHOT_BUILD_DEADLINE_MS) return snapshotInFlight;
-  snapshotStartedAt = Date.now();
-  const build: Promise<DealsSnapshot> = buildSnapshot()
-    .then((snapshot) => { cachedSnapshot = snapshot; writeSharedSnapshot(cacheOrigin, snapshot); return snapshot; })
+function refreshSnapshot(cacheOrigin: string, key: string): Promise<Stored> {
+  const running = buildsInFlight.get(key);
+  if (running && Date.now() - running.startedAt < SNAPSHOT_BUILD_DEADLINE_MS) return running.promise;
+  const build: Promise<Stored> = buildSnapshot(key)
+    .then((stored) => {
+      hold(stored);
+      // Fresher than the colo's record, which may be five minutes old: a shard built from D1 at a
+      // revision the colo has not learned yet is the current one, not a stale one to catch up.
+      if (stored.revision) knownRevision = stored.revision;
+      writeSharedSnapshot(cacheOrigin, stored);
+      return stored;
+    })
     // Never let one failed build poison later requests — clear the guard either way. Compared by
     // identity so an abandoned build that does eventually settle cannot clear the guard belonging
     // to the newer build that replaced it.
-    .finally(() => { if (snapshotInFlight === build) snapshotInFlight = null; });
-  snapshotInFlight = build;
+    .finally(() => { if (buildsInFlight.get(key)?.promise === build) buildsInFlight.delete(key); });
+  buildsInFlight.set(key, { promise: build, startedAt: Date.now() });
   return build;
 }
 
-// Guards the cold path the way snapshotInFlight guards the build, and for the same reason: a
-// request the runtime hard-kills never settles its promise, so a guard cleared only in `.finally`
-// would leave every later request on that isolate awaiting something that will never complete.
-// A deadline, not a finally.
-let coldStartInFlight: Promise<DealsSnapshot> | null = null;
-let coldStartStartedAt = 0;
-
 /**
- * Has the data changed under a snapshot we are still holding?
+ * Brings one shard up to date, preferring a copy another isolate in the colo has already built over
+ * building one from D1, and a copy another colo built over that.
  *
- * Runs at most once every REVISION_CHECK_MS per isolate and never blocks the request that triggers
- * it: the answer is only ever used to start a rebuild for the *next* request. A visitor is owed
- * deals, not the freshest possible deals, and the difference is bounded by the response's own
- * sixty-second max-age either way.
+ * Both ways a shard goes out of date used to go straight to a rebuild: a revision change, and the
+ * TTL running out. Every isolate in a colo reaches either at about the same moment, so each one
+ * read the whole catalogue out of D1 to build the same thing its neighbour had just published to
+ * the Cache API under the same key. The shared copy is consulted first on every path, and D1 is
+ * asked only when nobody has built this revision yet - or when the copy there is itself past its
+ * TTL.
+ *
+ * Single-flight per shard, with the same deadline as the build, for the same reason: once the TTL
+ * has run out every request comes through here until one of them finishes.
  */
-/**
- * Brings this isolate up to date, preferring a copy another isolate in the colo has already built
- * over building one from D1.
- *
- * Both ways a snapshot goes out of date used to go straight to a rebuild: a revision change, and
- * the TTL running out. Every isolate in a colo reaches either at about the same moment, so each
- * one read the whole catalogue out of D1 to build the same thing its neighbour had just published
- * to the Cache API under the same key. The shared copy was only consulted on a cold start. Now it
- * is consulted first on every path, and D1 is asked only when nobody in the colo has built this
- * revision yet - or when the copy there is itself past its TTL.
- *
- * Single-flight, with the same deadline as the build, for the same reason: once the TTL has run
- * out every request comes through here until one of them finishes.
- */
-let catchUpInFlight: Promise<DealsSnapshot> | null = null;
-let catchUpStartedAt = 0;
-function catchUp(cacheOrigin: string, knownRevision?: string): Promise<DealsSnapshot> {
-  if (catchUpInFlight && Date.now() - catchUpStartedAt < SNAPSHOT_BUILD_DEADLINE_MS) return catchUpInFlight;
-  catchUpStartedAt = Date.now();
-  const attempt: Promise<DealsSnapshot> = (async () => {
+function catchUp(cacheOrigin: string, key: string): Promise<Stored> {
+  const running = catchUpsInFlight.get(key);
+  if (running && Date.now() - running.startedAt < SNAPSHOT_BUILD_DEADLINE_MS) return running.promise;
+  const attempt: Promise<Stored> = (async () => {
+    // Learning which key to ask for is the cost of the key carrying the revision - usually the
+    // colo's record of it, at most one small query - and it buys the thing a fixed key could not do:
+    // a copy built before the last write is not merely detected, it is unaddressable, so no colo
+    // can serve it by accident.
     const revision = knownRevision || (await currentRevision(cacheOrigin).catch(() => ""));
     if (revision) {
+      knownRevision = revision;
       revisionCheckedAt = Date.now();
       // This colo's copy first, then the one another colo built, and D1 only when neither has it.
-      for (const read of [() => readSharedSnapshot(cacheOrigin, revision), () => readGlobalSnapshot(cacheOrigin, revision)]) {
+      for (const read of [() => readSharedSnapshot(cacheOrigin, key, revision), () => readGlobalSnapshot(cacheOrigin, key, revision)]) {
         const shared = await read();
         if (shared && shared.expiresAt > Date.now()) {
-          cachedSnapshot = shared;
+          hold(shared);
           return shared;
         }
       }
+      return refreshSnapshot(cacheOrigin, key);
     }
-    return refreshSnapshot(cacheOrigin);
-  })().finally(() => { if (catchUpInFlight === attempt) catchUpInFlight = null; });
-  catchUpInFlight = attempt;
+    // D1 may be refusing reads, which is when this path matters most. A revision we cannot learn
+    // falls back to the copy published under the fixed name, then to whatever R2 holds — knowingly
+    // stale, and far better than the 500 a cold isolate used to return during an outage.
+    const fallback = (await readFallbackSnapshot(cacheOrigin, key)) ?? (await readGlobalSnapshot(cacheOrigin, key, null));
+    if (!fallback) return refreshSnapshot(cacheOrigin, key);
+    hold(fallback);
+    return fallback;
+  })().finally(() => { if (catchUpsInFlight.get(key)?.promise === attempt) catchUpsInFlight.delete(key); });
+  catchUpsInFlight.set(key, { promise: attempt, startedAt: Date.now() });
   return attempt;
 }
 
+/**
+ * Has the data changed under the shards we are holding?
+ *
+ * Runs at most once every REVISION_CHECK_MS per isolate and never blocks the request that triggers
+ * it: a moved revision marks what is held as out of date and starts catching the held shards up
+ * behind the request; a request that arrives before that finishes serves the shard it has and the
+ * catch-up replaces it (loadSnapshot). A visitor is owed deals, not the freshest possible deals,
+ * and the difference is bounded by the response's own sixty-second max-age either way.
+ */
 function checkRevision(cacheOrigin: string) {
-  // Only ever asked about a snapshot we are holding. On a cold isolate there is nothing to compare
-  // against, and treating "no snapshot" as "wrong snapshot" made every cold start rebuild from D1
-  // rather than adopt the colo's copy — which is the whole thing the shared snapshot exists to
-  // avoid. The cold path below learns the revision for itself.
-  const held = cachedSnapshot?.revision;
-  if (!held) return;
+  // Only ever asked about shards we are holding. On a cold isolate there is nothing to compare
+  // against; the cold path learns the revision for itself.
+  if (!knownRevision) return;
   if (Date.now() - revisionCheckedAt < REVISION_CHECK_MS) return;
   revisionCheckedAt = Date.now();
   try {
     waitUntil(
       currentRevision(cacheOrigin)
         .then((revision) => {
-          // An empty revision means the query failed to produce one; rebuilding on that would
-          // rebuild forever.
-          if (!revision || revision === held) return;
-          return catchUp(cacheOrigin, revision);
+          // An empty revision means the query failed to produce one; moving to that would rebuild forever.
+          if (!revision || revision === knownRevision) return;
+          knownRevision = revision;
+          // Every shard held at the old revision is caught up now, behind this request, rather than
+          // behind the next request about each: an edit staff just made is then in hand for the
+          // next request, and a shard nobody asks for again costs one shared-cache read.
+          const behind = [...held.values()].filter((stored) => stored.revision !== revision);
+          return Promise.allSettled(behind.map((stored) => catchUp(cacheOrigin, stored.key)));
         })
         .catch(() => {}),
     );
   } catch {
-    // No request context to hang it on. The TTL below is still a backstop.
+    // No request context to hang it on. The TTL is still a backstop.
   }
 }
 
-async function loadSnapshot(cacheOrigin: string): Promise<DealsSnapshot> {
-  // Asked on every path, including the fresh one. A snapshot inside its TTL can still be wrong -
+/** One shard, from this isolate if it holds it, else from wherever it can be found. */
+async function loadSnapshot(cacheOrigin: string, key: string): Promise<Stored> {
+  // Asked on every path, including the fresh one. A shard inside its TTL can still be wrong -
   // that is exactly what a staff edit makes it - and the TTL alone cannot tell the difference
   // between old and wrong.
   checkRevision(cacheOrigin);
-  if (cachedSnapshot && cachedSnapshot.expiresAt > Date.now()) return cachedSnapshot;
-  // Stale but present: serve it now and let a single background refresh catch it up. Without this,
-  // a concurrent burst arriving right as the TTL rolls over would all block together on a fresh
-  // 5-query rebuild, a stampede that can push the Worker past its resource limits under load.
-  if (cachedSnapshot) { waitUntil(catchUp(cacheOrigin)); return cachedSnapshot; }
-
+  const stored = held.get(key);
+  if (stored) {
+    hold(stored);
+    // Current while it names the revision this isolate knows, or while nobody knows one.
+    if ((!knownRevision || stored.revision === knownRevision) && stored.expiresAt > Date.now()) return stored;
+    // Stale but present: serve it now and let a single background catch-up replace it. Without
+    // this, a concurrent burst arriving right as the revision moves would all block together on a
+    // fresh rebuild, a stampede that can push the Worker past its resource limits under load.
+    try { waitUntil(catchUp(cacheOrigin, key)); } catch { /* no request context */ }
+    return stored;
+  }
   // Nothing in memory. Before spending D1 queries, ask whether another isolate in this colo has
   // already built one — after a deploy, one of them almost certainly has — and then whether another
   // colo has.
-  if (coldStartInFlight && Date.now() - coldStartStartedAt < SNAPSHOT_BUILD_DEADLINE_MS) return coldStartInFlight;
-  coldStartStartedAt = Date.now();
-  const attempt: Promise<DealsSnapshot> = (async () => {
-    // Learning which key to ask for is the cost of the key carrying the revision - usually the
-    // colo's record of it, at most one small query - and it buys the thing the old fixed key could
-    // not do: a copy built before the last write is not merely detected, it is unaddressable, so no
-    // colo can serve it by accident.
-    // D1 may be refusing reads, which is when this path matters most. A revision we cannot learn
-    // falls back to the copy published under the fixed name, then to whatever R2 holds — knowingly
-    // stale, and far better than the 500 a cold isolate used to return during an outage.
-    const revision = await currentRevision(cacheOrigin).catch(() => "");
-    if (revision) revisionCheckedAt = Date.now();
-    const shared = revision
-      ? (await readSharedSnapshot(cacheOrigin, revision)) ?? (await readGlobalSnapshot(cacheOrigin, revision))
-      : (await readFallbackSnapshot(cacheOrigin)) ?? (await readGlobalSnapshot(cacheOrigin, null));
-    if (!shared) return refreshSnapshot(cacheOrigin);
-    cachedSnapshot = shared;
-    // Adopted copy may already be past its TTL — serve it, then catch up in the background, the
-    // same bargain the stale branch above makes. It cannot be out of date, only old: the key it
-    // came from names this revision.
-    if (shared.expiresAt <= Date.now()) {
-      try { waitUntil(refreshSnapshot(cacheOrigin)); } catch { /* no request context */ }
+  return catchUp(cacheOrigin, key);
+}
+
+/** The shards a request reads, loaded together. */
+async function loadShards(cacheOrigin: string, keys: readonly string[]): Promise<DealsShard[]> {
+  const loaded = await Promise.all(keys.map((key) => loadSnapshot(cacheOrigin, key)));
+  return loaded.filter((stored): stored is DealsShard => !isMeta(stored));
+}
+
+async function loadMeta(cacheOrigin: string): Promise<DealsMeta> {
+  const stored = await loadSnapshot(cacheOrigin, META_KEY);
+  if (!isMeta(stored)) throw new Error("the meta shard is not meta");
+  return stored;
+}
+
+/**
+ * The deals of several shards as one list, each deal once. A deal confirmed at branches in two cells
+ * is in both; the first copy met is kept, which is why cellsWithin puts the reader's own cell first.
+ */
+function mergeShards(shards: readonly DealsShard[]): DealBase[] {
+  if (shards.length === 1) return shards[0].bases;
+  const seen = new Set<string>();
+  const bases: DealBase[] = [];
+  for (const shard of shards) {
+    for (const base of shard.bases) {
+      if (seen.has(base.id)) continue;
+      seen.add(base.id);
+      bases.push(base);
     }
-    return shared;
-  })().finally(() => { if (coldStartInFlight === attempt) coldStartInFlight = null; });
-  coldStartInFlight = attempt;
-  return attempt;
+  }
+  return bases;
 }
 
 // A restaurant offering several distinct deals (a happy hour AND a trivia night, say) rightly
@@ -1530,25 +1758,6 @@ function facetsFor(deals: GroupedDeal[], citiesByOffer: boolean) {
     serviceStyles: Object.entries(serviceStyles).map(([value,total]) => ({ value, total })) };
 }
 
-// The newest source check, which the results header prints as "Latest source check". It was the
-// newest verified_at on the page being returned: a claim about the catalogue read off whichever 24
-// cards came first, and a needs_review deal's verified_at is only the moment it was imported, not a
-// check anyone made. So it is taken over every public deal, and only from the deals a check was
-// actually recorded on - verified ones, including those gone stale since, whose date is still a
-// real check. Nothing a request asks changes it, so it is worked out once per snapshot.
-const LATEST_SOURCE_CHECK = new WeakMap<readonly DealBase[], string | null>();
-function latestSourceCheck(bases: readonly DealBase[]) {
-  if (LATEST_SOURCE_CHECK.has(bases)) return LATEST_SOURCE_CHECK.get(bases) ?? null;
-  let latest: string | null = null, latestMs = -Infinity;
-  for (const deal of bases) {
-    if (deal.verification_status !== "verified" && deal.verification_status !== "stale") continue;
-    const at = deal.verified_at ? parseSqlTimestamp(deal.verified_at).getTime() : NaN;
-    if (Number.isFinite(at) && at > latestMs) { latestMs = at; latest = deal.verified_at; }
-  }
-  LATEST_SOURCE_CHECK.set(bases, latest);
-  return latest;
-}
-
 // How many distinct offers a market holds, for market_coverage.minimum_offers: the deals with a
 // confirmed branch within reach of where the request resolved, counted as the homepage counts
 // offers (offerKey, so a chain's promotion stored once per branch is one). Every deal, not the ones
@@ -1559,18 +1768,19 @@ function latestSourceCheck(bases: readonly DealBase[]) {
 // Counted only as far as `enough`, the market's minimum: the question is whether it has that many,
 // and a covered market answers it in its first few dozen deals. Asked on nearly every located
 // search now that a point finds its market, and a chain deal's key is five normalized fields
-// joined, so each key is kept for the life of the snapshot once worked out - but only for the deals
-// a request reached. Worked out for every deal at once, on the first located request of an
-// isolate, the keys were a millisecond of CPU locally, about four in production.
-const OFFER_KEYS = new WeakMap<readonly DealBase[], Map<string, string>>();
-function marketOfferCount(bases: readonly DealBase[], deals: readonly NormalizedDeal[], reachKm: number, enough: number) {
-  let keys = OFFER_KEYS.get(bases);
-  if (!keys) OFFER_KEYS.set(bases, keys = new Map());
+// joined, so each key is kept beside the deal it was worked out for, for as long as that deal's
+// shard is held - and only for the deals a request reached.
+const OFFER_KEYS = new WeakMap<DealBase, string>();
+function marketOfferCount(deals: readonly NormalizedDeal[], baseById: Map<string, DealBase>, reachKm: number, enough: number) {
   const offers = new Set<string>();
   for (const deal of deals) {
     if (deal.location_scope === "national" || deal.distance_km == null || deal.distance_km > reachKm) continue;
-    let key = keys.get(deal.id);
-    if (key === undefined) keys.set(deal.id, key = offerKey(deal));
+    const base = baseById.get(deal.id);
+    let key = base && OFFER_KEYS.get(base);
+    if (key === undefined) {
+      key = offerKey(deal);
+      if (base) OFFER_KEYS.set(base, key);
+    }
     offers.add(key);
     if (offers.size >= enough) break;
   }
@@ -1593,18 +1803,18 @@ type Availability = NonNullable<ReturnType<typeof availabilityFromStructuredSche
 // and an answer from earlier in the same UTC minute is the answer. It is kept per zone and per
 // locale as well, since a national offer is read in the reader's zone and the line is worded in
 // theirs. An offer's own end date is not in here: that can fall mid-minute, and is asked per request.
-const AVAILABILITY = new WeakMap<readonly DealBase[], Map<string, Array<{ zone: string | null; locale: SupportedLocale; minute: number; value: Availability }>>>();
+//
+// Kept beside the deal itself, in a WeakMap keyed by the snapshot's own object for it: a rebuilt
+// shard is new objects, which start with no answers, so an edit to a schedule is read afresh.
+const AVAILABILITY = new WeakMap<DealBase, Array<{ zone: string | null; locale: SupportedLocale; minute: number; value: Availability }>>();
 /** The zones and locales one deal's answers are kept for at once - a bound, not an expectation. */
 const AVAILABILITY_PER_DEAL_MAX = 8;
 
-function availabilityReader(bases: readonly DealBase[], now: Date, locale: SupportedLocale) {
-  let kept = AVAILABILITY.get(bases);
-  if (!kept) AVAILABILITY.set(bases, kept = new Map());
-  const byDeal = kept;
+function availabilityReader(now: Date, locale: SupportedLocale) {
   const minute = Math.floor(now.getTime() / 60_000);
   return (deal: DealBase, zone: string | null): Availability => {
-    let answers = byDeal.get(deal.id);
-    if (!answers) byDeal.set(deal.id, answers = []);
+    let answers = AVAILABILITY.get(deal);
+    if (!answers) AVAILABILITY.set(deal, answers = []);
     const known = answers.find((answer) => answer.zone === zone && answer.locale === locale);
     if (known && known.minute === minute) return known.value;
     const value = availabilityFromStructuredSchedule(deal.schedule_days,deal.start_time,deal.end_time,zone,now,locale) || availabilityFromSchedule(deal.schedule,now,zone,locale);
@@ -1617,7 +1827,7 @@ function availabilityReader(bases: readonly DealBase[], now: Date, locale: Suppo
   };
 }
 
-// referencesAlcohol's answer for each deal and each card, kept for the life of the snapshot.
+// referencesAlcohol's answer for each deal and each card, kept for the life of the deal's shard.
 //
 // The phone sends hideAlcohol=true on every deal read unless its reader has told the age gate they
 // may see drinks (withAudience in mobile/lib/api.ts), and a request that hides drinks asked the
@@ -1629,52 +1839,62 @@ function availabilityReader(bases: readonly DealBase[], now: Date, locale: Suppo
 //
 // Nothing the check reads changes from one request to the next. A deal's words are the snapshot's:
 // each request's copy of a deal adds its live half (availability, distance, relevance) and never
-// writes them. So a deal's answer is kept by its id, beside the snapshot it was read from, and a
-// new snapshot starts again. A card is the words of the deal it leads with plus the offers it
-// lists, and is kept by those ids.
+// writes them. So a deal's answer is kept beside the snapshot's own object for it, and a rebuilt
+// shard - new objects - starts again. A card is the words of the deal it leads with plus the offers
+// it lists, and is kept beside its lead by the ids of those offers.
 //
 // Either is kept only after confirming that what is in hand prints exactly the snapshot's words:
 // a deal its own row's, a card its lead's, and each of a card's offers its own deal's. The words
-// are compared with the snapshot's rows themselves (`words`, kept with the verdicts), not with the
-// request's copy of each deal - a change that rewrote the request's copy, the natural place to
-// translate a deal into the reader's language, would rewrite the thing compared with as well, and
-// the first locale to ask in a snapshot would decide every other's. Compared with the snapshot, a
-// rewritten copy is asked afresh: that change would cost speed here, never a wrong answer. Today
-// every copy prints its row's words (brandLocations replaces only a chain's branch lists), the
-// translation is laid over after the filter, and the comparison is nine string checks.
+// are compared with the snapshot's rows themselves (`baseById`), not with the request's copy of
+// each deal - a change that rewrote the request's copy, the natural place to translate a deal into
+// the reader's language, would rewrite the thing compared with as well, and the first locale to
+// ask in a snapshot would decide every other's. Compared with the snapshot, a rewritten copy is
+// asked afresh: that change would cost speed here, never a wrong answer. Today every copy prints
+// its row's words, the translation is laid over after the filter, and the comparison is nine string
+// checks.
 //
 // "Exactly" is every field the check reads, PRINTED_FIELDS: READABLE_FIELDS in app/alcohol.ts, the
 // list its `Readable` type is built from, so a field the check starts to read is compared here too.
 // The list used to be a copy kept here by hand, which a new field would have passed by: a card's
 // branch address, say, is the reader's nearest, and the first reader's would have decided the card
 // for everyone until the next snapshot.
-const DRINK_VERDICTS = new WeakMap<readonly DealBase[], { words: Map<string, DealBase>; deals: Map<string, boolean>; cards: Map<string, boolean> }>();
+const DEAL_VERDICTS = new WeakMap<DealBase, boolean>();
+const CARD_VERDICTS = new WeakMap<DealBase, Map<string, boolean>>();
+/** The most cards one deal is remembered leading at once - a bound, not an expectation. */
+const CARD_VERDICTS_PER_DEAL_MAX = 32;
 
-function drinkVerdicts(bases: readonly DealBase[]) {
-  let verdicts = DRINK_VERDICTS.get(bases);
-  if (!verdicts) DRINK_VERDICTS.set(bases, verdicts = { words: new Map(bases.map((base) => [base.id, base])), deals: new Map(), cards: new Map() });
-  const { words, deals, cards } = verdicts;
-  const kept = (known: Map<string, boolean>, key: string, deal: NormalizedDeal | GroupedDeal) => {
-    let verdict = known.get(key);
-    if (verdict === undefined) known.set(key, verdict = referencesAlcohol(deal));
-    return verdict;
-  };
-  // Whether `copy` prints, in every field the check reads, the snapshot's own words for deal `id`.
-  const prints = (copy: NormalizedDeal | GroupedDeal, id: string) => {
-    const row = words.get(id);
-    return !!row && PRINTED_FIELDS.every((field) => copy[field] === row[field]);
+function drinkVerdicts(baseById: Map<string, DealBase>) {
+  // The snapshot's row for deal `id`, when `copy` prints its words in every field the check reads.
+  const printing = (copy: NormalizedDeal | GroupedDeal, id: string) => {
+    const row = baseById.get(id);
+    return row && PRINTED_FIELDS.every((field) => copy[field] === row[field]) ? row : undefined;
   };
   return (deal: NormalizedDeal | GroupedDeal): boolean => {
     const offers = "brand_offers" in deal ? deal.brand_offers : undefined;
+    const row = printing(deal, deal.id);
     // One deal: every caller passes the request's copy of it today - the pruning, the offers a card
     // may lead with, the nationwide list - and a copy that no longer prints its row's words is asked
     // afresh rather than given the verdict those words had.
-    if (!offers) return prints(deal, deal.id) ? kept(deals, deal.id, deal) : referencesAlcohol(deal);
-    const faithful = prints(deal, deal.id) && offers.every((offer) => {
-      const row = words.get(offer.id);
-      return !!row && offer.title === row.title && offer.price === row.price && offer.category === row.category;
+    if (!offers) {
+      if (!row) return referencesAlcohol(deal);
+      let verdict = DEAL_VERDICTS.get(row);
+      if (verdict === undefined) DEAL_VERDICTS.set(row, verdict = referencesAlcohol(deal));
+      return verdict;
+    }
+    const faithful = !!row && offers.every((offer) => {
+      const own = baseById.get(offer.id);
+      return !!own && offer.title === own.title && offer.price === own.price && offer.category === own.category;
     });
-    return faithful ? kept(cards, JSON.stringify([deal.id, ...offers.map((offer) => offer.id)]), deal) : referencesAlcohol(deal);
+    if (!faithful || !row) return referencesAlcohol(deal);
+    let cards = CARD_VERDICTS.get(row);
+    if (!cards) CARD_VERDICTS.set(row, cards = new Map());
+    const key = offers.map((offer) => offer.id).join("|");
+    let verdict = cards.get(key);
+    if (verdict === undefined) {
+      if (cards.size >= CARD_VERDICTS_PER_DEAL_MAX) cards.clear();
+      cards.set(key, verdict = referencesAlcohol(deal));
+    }
+    return verdict;
   };
 }
 
@@ -1778,9 +1998,12 @@ export async function GET(request: Request) {
     ? new Set((await env.DB.prepare("SELECT restaurant_id FROM excluded_restaurants WHERE user_id=?").bind(signedInUser.userId).all<{ restaurant_id: string }>()).results.map((row) => row.restaurant_id))
     : new Set<string>();
   // Ahead of resolving the place, because a typed city is resolved against the markets it names.
+  // The deals themselves come after: which shards of the snapshot a request reads depends on where
+  // it resolved to and what it asks for.
   isolateRequests += 1;
-  const arrivedWarm = cachedSnapshot !== null;
-  const { bases, brands, coverageRows, translationsByDeal, aliases, centers } = await loadSnapshot(url.origin);
+  const arrivedWarm = held.size > 0;
+  const meta = await loadMeta(url.origin);
+  const { coverageRows, aliases, centers } = meta;
 
   // A bare point is the reader's own position: it names no country and no clock, and both used to
   // default to Canada's - Toronto time and Canada's chains for a reader in Knoxville. Its country is
@@ -1818,79 +2041,6 @@ export async function GET(request: Request) {
   const origin = resolvedLocation ? { latitude:resolvedLocation.latitude,longitude:resolvedLocation.longitude } : devicePoint;
   const normalizedQuery = normalizeSearch(q);
 
-  // The branches of each large brand this request is about - once per brand, shared by every deal
-  // the brand runs. Near the reader: every branch in range, nearest first. In a named state or
-  // province: that one's branches. Otherwise a page's worth, which is all an unlocated card shows.
-  // Everything downstream - the grouping, the branch a card leads with, the radius and province
-  // filters, the capped arrays in the response - then works on these exactly as it works on a small
-  // chain's full list, while the totals it reports were measured over every branch at build time.
-  const brandSubsets = new Map<string, BranchRow[]>();
-  const brandSubset = (restaurantId: string, index: BrandIndex) => {
-    let subset = brandSubsets.get(restaurantId);
-    if (!subset) {
-      subset = origin
-        ? nearestBranches(index, origin, radius, PAYLOAD_LOCATION_MAX, BRAND_SUBSET_MAX)
-        : requestedProvince
-          ? (index.byRegion.get(requestedProvince.toUpperCase()) || []).slice(0, BRAND_SUBSET_MAX)
-          : index.branches.slice(0, PAYLOAD_LOCATION_MAX);
-      brandSubsets.set(restaurantId, subset);
-    }
-    return subset;
-  };
-  const brandLocations = (base: DealBase) => {
-    const index = base.brand_ref ? brands.get(base.brand_ref) : undefined;
-    // A deal in the other country is dropped by the country filter below whatever it carries, so
-    // it is not worth measuring its brand for.
-    if (!index || (requestedCountry && String(base.country || "").toUpperCase() !== requestedCountry)) return null;
-    let branches = brandSubset(base.brand_ref!, index);
-    // The deal's own branch leads an unlocated card, as it always has, so it has to be among them.
-    const own = !origin && base.eligible_location_id ? index.byId.get(base.eligible_location_id) : undefined;
-    if (own && !branches.includes(own) && (!requestedProvince || String(own.region || "").toUpperCase() === requestedProvince.toUpperCase())) branches = [own, ...branches];
-    const explicit = base.location_eligibility
-      ? { get: (id: string) => base.location_eligibility![id] as readonly [string, string | null] | undefined }
-      : undefined;
-    const locations = branches.map((branch) => { const [eligibility, source] = eligibilityAt(base, explicit, branch); return locationOf(branch, eligibility, source, base); });
-    return {
-      chain_locations: locations,
-      participating_locations: locations.filter((location) => location.offer_available),
-      other_brand_locations: locations.filter((location) => !location.offer_available),
-    };
-  };
-
-  // Each deal's schedule against the clock, from what this minute already worked out - see AVAILABILITY.
-  const availabilityOf = availabilityReader(bases, now, locale);
-  const raw = bases.map((baseRow): NormalizedDeal => {
-    const drawn = baseRow.brand_ref ? brandLocations(baseRow) : null;
-    const base = drawn ? { ...baseRow, ...drawn } : baseRow;
-    // A deal past its own expires_at can still be `status='live'` for up to
-    // EXPIRY_GRACE_PERIOD_DAYS until the cleanup cron catches up — the time-of-day schedule
-    // check has no idea about that and would otherwise call it "Available now" the moment
-    // today's happy-hour window opens, contradicting the "Recently ended" badge on the same card.
-    const isPastExpiry = !!base.expires_at && parseSqlTimestamp(base.expires_at).getTime() <= nowMs;
-    const zone = base.timezone || (base.location_scope === "national" ? readerTimezone : null);
-    const available = isPastExpiry
-      ? { eligibleToday: false, availableNow: false, phase: "ended" as const, label: dealLabels(locale).offerEnded, tonight: false }
-      : availabilityOf(base, zone);
-    const eligibleDistances = origin ? base.chain_locations.filter((location) => location.offer_available && location.latitude != null && location.longitude != null).map((location) => kmBetween(origin,{latitude:Number(location.latitude),longitude:Number(location.longitude)})) : [];
-    const metadataWeight = normalizedQuery ? base.indexed.reduce((total,item) => normalizeSearch(item.term).includes(normalizedQuery) ? total + Number(item.weight || 0) : total,0) : 0;
-    return {
-      ...base,
-      distance_km: eligibleDistances.length ? Math.min(...eligibleDistances) : null,
-      availability: available.label,
-      available_today: available.eligibleToday,
-      available_now: available.availableNow,
-      availability_phase: available.phase,
-      tonight: available.tonight,
-      search_score: relevanceScore(base.search_keywords,q,base.restaurant,base.title) + metadataWeight,
-      expiry_timezone: expiryTimeZone(base),
-    };
-  });
-  const rawById = new Map(raw.map((deal) => [deal.id, deal]));
-  // What the drink filter says of a deal or a card, from the snapshot's memory where it can be.
-  const drinkVerdict = drinkVerdicts(bases);
-  function offerSummary(deal: NormalizedDeal): OfferSummary {
-    return { id: deal.id, slug: deal.slug, title: deal.title, price: deal.price, schedule: deal.schedule, category: deal.category, address: deal.address, city: deal.city, source_url: deal.source_url, available_today: deal.available_today };
-  }
   // Fetch specific deals by id or slug. Added for the mobile Saved tab, which holds a list of
   // favorited ids and would otherwise have to request each one separately — a phone firing
   // dozens of parallel requests to render one screen. Everything else about the pipeline applies
@@ -1925,6 +2075,81 @@ export async function GET(request: Request) {
   // after the sort. Only the nationwide list is grouped this way; the local one is already a card
   // per place.
   const groupByBrand = url.searchParams.get("group") === "brand";
+
+  // The shards of the snapshot this request reads - see DealsShard. A request for deals by id reads
+  // a shard built for those ids alone; a nationwide list its country's promotions, and with national
+  // chains in their own section their branch deals as the local list would find them: the cells
+  // around a placed reader, else the country; a placed search the cells its reach covers; and a
+  // search with no place its country, or every country the catalogue has deals in.
+  //
+  // Few, on purpose: the free plan allows a request fifty subrequests, and a shard read, a D1 query
+  // and a cache write are each one. A placed search is the meta shard and at most six cells.
+  //
+  // Reach is at least the default radius, because the market-coverage verdict below is measured
+  // over that much whatever the reader narrowed to.
+  const reachKm = Math.max(radius, COVERAGE_REACH_KM);
+  const requestedShardCountry = shardCountry(requestedCountry);
+  const countryKeys = (country: string | null) => (country ? [country] : meta.countries).map(countryKey);
+  let shards: DealsShard[];
+  if (ids.size) {
+    shards = [await buildShard("ids", { kind: "ids", ids: [...wantedIds], point: origin })];
+  } else if (nationalOnly) {
+    const marketCountry = requestedShardCountry || shardCountry(String(resolvedLocation?.country || "").toUpperCase());
+    const keys = (marketCountry ? [marketCountry] : meta.countries).map(nationalKey);
+    if (chainsSeparate) keys.push(...(origin ? cellsWithin(origin, reachKm) : countryKeys(marketCountry)));
+    shards = await loadShards(url.origin, keys);
+  } else {
+    shards = await loadShards(url.origin, origin ? cellsWithin(origin, reachKm) : countryKeys(requestedShardCountry));
+  }
+  const bases = mergeShards(shards);
+  // The snapshot's own object for each deal, which the memories below are kept beside.
+  const baseById = new Map(bases.map((base) => [base.id, base]));
+  const translationOf = (id: string) => {
+    for (const shard of shards) {
+      const translation = shard.translationsByDeal.get(id);
+      if (translation) return translation;
+    }
+    return undefined;
+  };
+
+  // Each deal's schedule against the clock, from what this minute already worked out - see AVAILABILITY.
+  const availabilityOf = availabilityReader(now, locale);
+  const raw = bases.map((base): NormalizedDeal => {
+    // A deal past its own expires_at can still be `status='live'` for up to
+    // EXPIRY_GRACE_PERIOD_DAYS until the cleanup cron catches up — the time-of-day schedule
+    // check has no idea about that and would otherwise call it "Available now" the moment
+    // today's happy-hour window opens, contradicting the "Recently ended" badge on the same card.
+    const isPastExpiry = !!base.expires_at && parseSqlTimestamp(base.expires_at).getTime() <= nowMs;
+    const zone = base.timezone || (base.location_scope === "national" ? readerTimezone : null);
+    const available = isPastExpiry
+      ? { eligibleToday: false, availableNow: false, phase: "ended" as const, label: dealLabels(locale).offerEnded, tonight: false }
+      : availabilityOf(base, zone);
+    const eligibleDistances = origin ? base.chain_locations.filter((location) => location.offer_available && location.latitude != null && location.longitude != null).map((location) => kmBetween(origin,{latitude:Number(location.latitude),longitude:Number(location.longitude)})) : [];
+    const metadataWeight = normalizedQuery ? base.indexed.reduce((total,item) => item.term.includes(normalizedQuery) ? total + Number(item.weight || 0) : total,0) : 0;
+    return {
+      ...base,
+      // The 30-day "stale" label, read against the clock here rather than fixed when the shard was
+      // built, so that a check ageing past thirty days shows as stale without a rebuild (the
+      // revision used to carry the date for this, and rebuilt every colo's snapshot at midnight).
+      effective_verification_status: base.under_review
+        ? "stale"
+        : base.verification_status === "verified" && nowMs - timeOf(base.verified_at) > STALE_AFTER_MS ? "stale" : base.verification_status,
+      distance_km: eligibleDistances.length ? Math.min(...eligibleDistances) : null,
+      availability: available.label,
+      available_today: available.eligibleToday,
+      available_now: available.availableNow,
+      availability_phase: available.phase,
+      tonight: available.tonight,
+      search_score: relevanceOfNormalized(base.search_text,q,base.restaurant,base.title) + metadataWeight,
+      expiry_timezone: expiryTimeZone(base),
+    };
+  });
+  const rawById = new Map(raw.map((deal) => [deal.id, deal]));
+  // What the drink filter says of a deal or a card, from the snapshot's memory where it can be.
+  const drinkVerdict = drinkVerdicts(baseById);
+  function offerSummary(deal: NormalizedDeal): OfferSummary {
+    return { id: deal.id, slug: deal.slug, title: deal.title, price: deal.price, schedule: deal.schedule, category: deal.category, address: deal.address, city: deal.city, source_url: deal.source_url, available_today: deal.available_today };
+  }
   const cuisines = parseList(url.searchParams.getAll("cuisine"));
   const categories = parseList(url.searchParams.getAll("category"));
   // Three price tiers, multi-select like cuisine/category. Matching happens against the same
@@ -1969,7 +2194,7 @@ export async function GET(request: Request) {
   // above), not from the stored word. Matched on the stored word it returned a Wednesday wing night
   // on a Tuesday, which was most of what it returned on any given day.
   const offerMatches = (deal: NormalizedDeal) =>
-    (!q || matchesQuery(`${deal.search_keywords} ${deal.restaurant} ${deal.title} ${deal.schedule} ${deal.price}`,q)) &&
+    (!q || matchesNormalizedQuery(deal.search_text,q)) &&
     (!categories.length || categories.some((value) => value.toLowerCase() === "tonight" ? deal.tonight : value.toLowerCase() === deal.category.toLowerCase())) &&
     (!priceTiers.size || (deal.price_tier != null && priceTiers.has(deal.price_tier))) &&
     (!day || (weekday != null && offerRunsOn(weekday, deal.schedule, deal.schedule_days, deal.start_time, deal.end_time))) &&
@@ -2016,7 +2241,7 @@ export async function GET(request: Request) {
         if (!confirmed.has(location.address)) { existing.participating_locations.push(location); confirmed.add(location.address); }
       }
       existing.brand_offers.push(offerSummary(deal));
-      existing.search_keywords += ` ${deal.search_keywords} ${deal.title} ${deal.price} ${deal.schedule}`;
+      existing.search_text += ` ${deal.search_text}`;
       if (deal.search_score > existing.search_score) existing.search_score = deal.search_score;
       if (timeOf(deal.verified_at) > timeOf(existing.verified_at)) existing.verified_at = deal.verified_at;
     }
@@ -2046,7 +2271,7 @@ export async function GET(request: Request) {
     participating_locations: deal.participating_locations,
     other_brand_locations: deal.other_brand_locations,
     offer_varies_by_location: deal.offer_varies_by_location,
-    ...(alone ? {} : { search_keywords: deal.search_keywords, search_score: deal.search_score, verified_at: deal.verified_at }),
+    ...(alone ? {} : { search_keywords: deal.search_keywords, search_text: deal.search_text, search_score: deal.search_score, verified_at: deal.verified_at }),
   });
   // Places none of whose offers pass the request's offer filters - see the lead below.
   const unmatched = new Set<GroupedDeal>();
@@ -2261,20 +2486,13 @@ export async function GET(request: Request) {
       });
     }
   }
-  const totalCanonicalOffers = grouped.length;
-  // The homepage's "N restaurants · M cities", counted over the same local list as the total just
-  // above - the cards the page lists, before any filter or place narrows them - so the hero and the
-  // list's own "N matches" count one thing. They used to be counted over every row in the catalog,
-  // national chains' branches included: the hero said 559 offers in 52 cities over a list that
-  // said 249 matches, and the age-suitability page said 38 cities. The offers' own cities rather
-  // than the cards', because a card's city moves to whichever branch is nearest the reader.
-  //
-  // Counted by offerCities, the function the place picker's list is counted by (see facetsFor), so
-  // the two are one number for one audience: after the drinks a reader has hidden are pruned, a
-  // city whose every listing is a drink is in neither.
-  const catalogCities = new Set<string>();
-  for (const deal of grouped) for (const city of offerCities(deal)) catalogCities.add(city);
-  const cityCount = catalogCities.size;
+  // The homepage's "N restaurants · M cities", counted over the whole catalogue the way the local
+  // list is grouped, before any filter or place narrows it - see catalogCounts, which is where the
+  // counting moved when a request stopped reading the whole catalogue. With drinks hidden, a city
+  // whose every listing is a drink is in neither the count nor the place picker (facetsFor).
+  const counts = chainsSeparate ? meta.counts.separate : meta.counts.all;
+  const totalCanonicalOffers = counts.cards;
+  const cityCount = hideAlcohol ? counts.foodCities : counts.cities;
   let filtered = grouped.filter((deal) =>
     (!ids.size || wanted(deal)) &&
     (deal.vertical || "restaurant").toLowerCase() === vertical &&
@@ -2450,10 +2668,10 @@ export async function GET(request: Request) {
     // page shows from the database. A field reaches readers only by being left out of this list,
     // and tests/deals-public-fields.test.mjs fails on any field that appears here without a decision.
     const {
-      search_keywords: unusedKeywords, search_score: unusedScore, indexed: unusedIndexed,
-      internal_notes: unusedNotes, deleted_at: unusedDeletedAt, publish_at: unusedPublishAt,
+      search_keywords: unusedKeywords, search_text: unusedSearchText, search_score: unusedScore, indexed: unusedIndexed,
+      footprint_regions: unusedFootprintRegions, internal_notes: unusedNotes, deleted_at: unusedDeletedAt, publish_at: unusedPublishAt,
       owner_confirmed_at: unusedOwnerConfirmed, under_review: unusedUnderReview,
-      location_eligibility: unusedEligibility, location_id: unusedLocationId, eligible_location_id: unusedEligibleLocation,
+      location_id: unusedLocationId, eligible_location_id: unusedEligibleLocation,
       primary_city: unusedPrimaryCity, national_chain: unusedNationalChain, discount_percent: unusedDiscount,
       savings_cents: unusedSavings, restaurant_footprint: unusedFootprint, restaurant_country: unusedCountry,
       restaurant_phone: unusedPhone, location_website: unusedLocationWebsite,
@@ -2465,7 +2683,7 @@ export async function GET(request: Request) {
     // per-field to the English original when that field hasn't been translated yet (or ever, if
     // DeepL isn't configured) rather than showing a blank.
     if (locale === "en") return { ...rest, category_label: rest.category, cuisine_label: rest.cuisine };
-    const translation = translationsByDeal.get(rest.id)?.[locale];
+    const translation = translationOf(rest.id)?.[locale];
     return {
       ...rest,
       title: translation?.title || rest.title,
@@ -2479,7 +2697,7 @@ export async function GET(request: Request) {
       // A brand card's offers are deals of their own, each with its own translation.
       ...(rest.chain_offers ? {
         chain_offers: rest.chain_offers.map((offer) => {
-          const own = translationsByDeal.get(offer.id)?.[locale];
+          const own = translationOf(offer.id)?.[locale];
           return own ? { ...offer, title: own.title || offer.title, schedule: own.schedule || offer.schedule, price: own.price || offer.price } : offer;
         }),
       } : {}),
@@ -2487,7 +2705,24 @@ export async function GET(request: Request) {
   // Last, on the page being returned rather than everything that matched: a national chain's
   // location arrays are bounded here, and their true totals become their own fields. See
   // app/dealView.ts. Applied to both shapes, because the full row is what the website reads.
-  }).map((deal) => capDealLocations(deal as Record<string, unknown>, point) as typeof deal);
+  //
+  // A request that names a province and no place is answered from the country's shard, whose cards
+  // carry a sample of branches from every province (BRANCHES_PER_REGION); the filter above has
+  // already kept only the chains with a branch in the province, and the card shows those branches,
+  // not Texas's to a reader who asked for Tennessee. A located request keeps the branches in reach,
+  // whatever province they are in - a reader in Ottawa is shown Gatineau. A nationwide promotion has
+  // no branches to trim.
+  }).map((deal) => {
+    if (requestedProvince && !origin && deal.location_scope !== "national" && deal.chain_locations.length) {
+      const inProvince = (location: { region?: string | null }) => String(location.region || deal.region || "").toLowerCase() === requestedProvince.toLowerCase();
+      Object.assign(deal, {
+        chain_locations: deal.chain_locations.filter(inProvince),
+        participating_locations: deal.participating_locations.filter(inProvince),
+        other_brand_locations: deal.other_brand_locations.filter(inProvince),
+      });
+    }
+    return capDealLocations(deal as Record<string, unknown>, point) as typeof deal;
+  });
   // A search with no resolved location at all (a bare keyword query, or the initial
   // nationwide load) has no "area" for a market-coverage verdict to be about — falling
   // through to the totalMatches-based guess below used to label a perfectly successful
@@ -2498,7 +2733,6 @@ export async function GET(request: Request) {
   // names are the reader's own words, then the place its postal code or city resolved to without the
   // FSA's list of neighbourhoods; a bare device point has none, and is placed by where it is. Only a
   // typed city used to find its row, and the website sends a point for every search.
-  const reachKm = Math.max(radius, COVERAGE_REACH_KM);
   const placeNames = resolvedLocation
     ? [requestedCity, resolvedLocation.accuracy === "device" ? null : displayCity(resolvedLocation.city)].map((name) => canonicalCity(name))
     : [];
@@ -2524,11 +2758,11 @@ export async function GET(request: Request) {
     : !coverageRow
       ? (totalMatches ? "limited" : "no_coverage")
       : coverageRow.status !== "no_coverage" && Number(coverageRow.minimum_offers) > 0
-          && marketOfferCount(bases, raw, reachKm, Number(coverageRow.minimum_offers)) < Number(coverageRow.minimum_offers)
+          && marketOfferCount(raw, baseById, reachKm, Number(coverageRow.minimum_offers)) < Number(coverageRow.minimum_offers)
         ? "limited"
         : coverageRow.status;
-  // Over the whole public catalogue, not this page - see latestSourceCheck.
-  const latestVerificationDate = latestSourceCheck(bases);
+  // Over the whole public catalogue, not this page - see buildMeta.
+  const latestVerificationDate = meta.latestSourceCheck;
   // The search this was, for recordSearch. Only real keyword searches: a bare browse, a filter
   // change and a map pan all arrive here too, and none of them is a question anyone asked in words.
   //

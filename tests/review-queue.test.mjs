@@ -148,8 +148,10 @@ test("the queue's SQL reads the real schema and takes in exactly the deals that 
 test("the workspace reads the server's ranked queue, not the loaded 500 rows", () => {
   const client = adminClientSource();
   const route = readFileSync(new URL("../app/api/admin/route.ts", import.meta.url), "utf8");
-  assert.match(route, /env\.DB\.prepare\(REVIEW_QUEUE_SQL\)/);
-  assert.match(route, /reviewQueue: buildReviewQueue\(/);
+  assert.match(route, /const db = collectReads\(env\.DB\);/);
+  assert.match(route, /db\.prepare\(REVIEW_QUEUE_SQL\)/);
+  assert.match(route, /\(\) => buildReviewQueue\(reviewQueueRows\.results \|\| \[\]\)/);
+  assert.match(route, /"reviewQueue":\$\{reviewQueueJson\}/);
   assert.match(client, /data\?\.reviewQueue\?\.items/);
   // The old client-side queue filtered data.deals, which stops at 500 rows and mixes in retired deals.
   assert.doesNotMatch(client, /const reviewQueue = useMemo/);

@@ -475,12 +475,28 @@ export interface DrinkRuleAlert {
 /** At most this many in the admin's list; blocking ones first. */
 export const DRINK_RULE_ALERT_LIMIT = 60;
 
+// Each live deal's issues, kept beside the words they were read from. The check runs a dozen
+// patterns over every live deal's copy - some fifty milliseconds of CPU across the catalogue, on a
+// Worker allowed ten a request - and the workspace asks for it again whenever any deal changes
+// (workspaceParts in app/api/admin/route.ts). The answer for a deal depends on nothing but its
+// row, so a deal whose row reads as it did last time keeps its answer, and an edit re-reads the
+// one deal it touched. Bounded to the catalogue's size: a deal that leaves the live list leaves
+// the map at the next build.
+const ISSUES_BY_DEAL = new Map<string, { row: string; issues: DrinkRuleIssue[] }>();
+const rowKey = (row: DrinkRuleRow) => JSON.stringify([row.restaurant, row.title, row.price, row.description, row.category, row.cuisine, row.terms, row.restrictions, row.schedule, row.source_url, row.location_scope, row.website, row.national_country, row.footprint, row.places, row.windows]);
+
 export function buildDrinkRuleAlerts(rows: readonly (DrinkRuleRow & { city?: string | null; emoji?: string | null })[]): DrinkRuleAlert[] {
   const alerts: DrinkRuleAlert[] = [];
+  const seen = new Map<string, { row: string; issues: DrinkRuleIssue[] }>();
   for (const row of rows) {
-    const issues = drinkIssuesForRow(row);
+    const key = rowKey(row);
+    const known = ISSUES_BY_DEAL.get(row.id);
+    const issues = known && known.row === key ? known.issues : drinkIssuesForRow(row);
+    seen.set(row.id, { row: key, issues });
     if (issues.length) alerts.push({ id: row.id, restaurant: String(row.restaurant || ""), title: String(row.title || ""), city: String(row.city || ""), emoji: String(row.emoji || ""), issues });
   }
+  ISSUES_BY_DEAL.clear();
+  for (const [id, entry] of seen) ISSUES_BY_DEAL.set(id, entry);
   const blocks = (alert: DrinkRuleAlert) => alert.issues.some((issue) => issue.severity === "block") ? 0 : 1;
   return alerts.sort((a, b) => blocks(a) - blocks(b) || a.city.localeCompare(b.city) || a.restaurant.localeCompare(b.restaurant)).slice(0, DRINK_RULE_ALERT_LIMIT);
 }

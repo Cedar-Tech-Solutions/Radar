@@ -545,14 +545,43 @@ function isFlightRequest(request: Request, url: URL): boolean {
   return url.searchParams.has("_rsc") || url.pathname.endsWith(".rsc");
 }
 
-// A reader the render would recognise, and so one whose page is theirs alone: Clerk's session
-// cookie, or a bearer token, which getAppUser in app/auth.ts reads ahead of the cookie. The token
-// was not checked here before, so a page request carrying one could have been rendered signed in
-// and stored for everyone; any Authorization header at all now keeps a request out of the bake and
-// the cache.
+// A reader the render would recognise: Clerk's session cookie, or a bearer token, which getAppUser
+// in app/auth.ts reads ahead of the cookie. The token was not checked here before, so a page request
+// carrying one could have been rendered signed in and stored for everyone; any Authorization header
+// at all now keeps a request's render out of the cache.
 function isSignedIn(request: Request): boolean {
   return (request.headers.get("cookie") || "").includes("__session=") || request.headers.has("authorization");
 }
+
+// The Clerk cookies and the bearer token, left out of a request rendered for the colo's cache
+// (refreshPage): the render then sees a signed-out reader, whatever reader's stale hit set it off.
+const SESSION_COOKIE = /^(__session|__client_uat|__clerk)/;
+
+function signedOutHeaders(headers: Headers): Headers {
+  const out = new Headers(headers);
+  out.delete("authorization");
+  const cookie = (headers.get("cookie") || "").split(/; */).filter((pair) => pair && !SESSION_COOKIE.test(pair));
+  if (cookie.length) out.set("cookie", cookie.join("; "));
+  else out.delete("cookie");
+  return out;
+}
+
+// The pages whose server render reads nothing of the reader: the home page, the static pages and
+// the city guides. Their render reads the session cookie in one place only, RootShell, which marks
+// <html data-signed-in> and mounts Clerk by it - and the Worker can add that mark itself
+// (signedInCopy). So a signed-in reader of one of these is answered as a signed-out one is, from
+// the baked file or the colo's copy with the mark added, and the client picks the rest up from the
+// mark (app/has-session.tsx, app/ClerkClientProvider.tsx).
+//
+// Every page a signed-in reader opened used to render, because RootShell reads the cookie. For the
+// staff who are signed in on every visit, that was a full render of the home page - 25 to 57 ms of
+// CPU locally, past the free plan's limit several times over - on every page load, including the
+// ones a signed-out reader gets for nothing. tests/route-params.test.mjs holds this list to the
+// pages: a route here may read no header or cookie but the ones every reader shares.
+//
+// Not the deal page, which narrows its branches by the reader's saved postal code; not /pro, which
+// reads who is signed in; not the sign-in shells, which mount Clerk themselves.
+const USER_BLIND_ROUTES = new Set(["", "terms", "privacy", "support", "age-suitability", "for-restaurants", "for-creators", "cities", "cities/[city]", "cities/[city]/[topic]", "ottawa", "ottawa/[topic]"]);
 
 type PageLookup = {
   // The address the baked file and the colo's copy are found under: the request's own path, with
@@ -561,13 +590,17 @@ type PageLookup = {
   // Whether the request itself had no query string. One that had one is rendered as `url` on a
   // miss, in its place (see the fetch handler).
   bare: boolean;
+  // A signed-in reader of a page that reads nothing of them (USER_BLIND_ROUTES): answered from the
+  // shared page with the signed-in mark added, and never the one whose render is stored.
+  signedIn: boolean;
 };
 
 // Whether a page request may be answered with the page every signed-out reader of its address
 // gets, and the address to look that page up under; null when the request is personal and has to
 // be rendered for this reader alone. GET and HEAD only - a HEAD is answered with the same headers
-// and no body - and never a flight or a signed-in reader. A query string is allowed when none of its
-// parameters is one its route's server render reads (SERVER_READ_PARAMS).
+// and no body - and never a flight. A signed-in reader is answered that way only on the pages that
+// read nothing of them (USER_BLIND_ROUTES). A query string is allowed when none of its parameters
+// is one its route's server render reads (SERVER_READ_PARAMS).
 //
 // Nor an address spelled in a way these checks cannot vouch for. They compare the path's raw
 // segments, and the app routes on decoded ones: /en/pr%6F is the Pro page to the app and an
@@ -581,18 +614,40 @@ type PageLookup = {
 // A deal's slug, the third segment, may be encoded: it names the deal however it is spelled.
 function pageLookup(request: Request, url: URL): PageLookup | null {
   if (request.method !== "GET" && request.method !== "HEAD") return null;
-  if (isFlightRequest(request, url) || isSignedIn(request)) return null;
+  if (isFlightRequest(request, url)) return null;
   if (url.pathname.includes("//")) return null;
   const segments = url.pathname.split("/").filter(Boolean);
   if (segments.slice(0, 2).some((segment) => segment.includes("%"))) return null;
   if (!CACHEABLE_LOCALES.has(segments[0])) return null;
   if (segments[1] && UNCACHEABLE_SEGMENTS.has(segments[1]) && !(segments.length === 2 && AUTH_SHELLS.has(segments[1]))) return null;
-  if (!url.search) return { url, bare: true };
   const route = routeOf(segments);
+  const signedIn = isSignedIn(request);
+  if (signedIn && (route === null || !USER_BLIND_ROUTES.has(route))) return null;
+  if (!url.search) return { url, bare: true, signedIn };
   const read = route === null ? undefined : SERVER_READ_PARAMS.get(route);
   if (!read) return null;
   for (const key of url.searchParams.keys()) if (read.includes(key)) return null;
-  return { url: new URL(url.pathname, url.origin), bare: false };
+  return { url: new URL(url.pathname, url.origin), bare: false, signedIn };
+}
+
+// The shared page, for a signed-in reader of one of USER_BLIND_ROUTES: the mark RootShell puts on
+// <html> for a render that saw the session cookie, added to the copy every reader gets. The mark is
+// what the page's own scripts read to fetch Clerk ahead of hydration (app/clerk-react.ts), give the
+// header its signed-in row from the first paint (site-chrome.css) and mount Clerk and the
+// client-side links once hydrated. Nothing else in the page differs for them.
+//
+// By a string replacement over the whole body rather than a streaming rewrite: a baked page is a
+// few hundred kilobytes, which is a fraction of a millisecond to decode and search, and the one
+// code path runs the same under the test harness, which has no HTMLRewriter. A 304 and a HEAD carry
+// no body to mark, and a page with no <html> is sent as it is.
+async function signedInCopy(response: Response): Promise<Response> {
+  if (!response.body || response.status === 304) return response;
+  const text = await response.text();
+  const marked = text.replace(/<html(?=[\s>])/i, '<html data-signed-in=""');
+  const headers = new Headers(response.headers);
+  // The body is a different length now; the runtime measures the new one.
+  headers.delete("content-length");
+  return new Response(marked, { status: response.status, statusText: response.statusText, headers });
 }
 
 // Origin + pathname, since a stored page is the bare address's and dropping everything else keeps
@@ -1049,7 +1104,9 @@ async function refreshPage(request: Request, env: Env, ctx: ExecutionContext, ur
     // Under the watchdog too. A refresh on a wedged isolate would otherwise hold its waitUntil open
     // until the runtime gives up on it, and it is as good a sign of a wedge as a visitor's render.
     const deadline = renderDeadlineMs(Date.now(), env.RENDER_DEADLINE_MS);
-    const bare = new Request(`${url.origin}${url.pathname}`, { method: "GET", headers: request.headers });
+    // Rendered as a signed-out reader whoever's stale hit set it off: the copy is for every reader,
+    // and a signed-in reader's hit can set one off too (pageLookup).
+    const bare = new Request(`${url.origin}${url.pathname}`, { method: "GET", headers: signedOutHeaders(request.headers) });
     const fresh = await withinDeadline(renderPage(bare, env, ctx), deadline);
     if (fresh === RENDER_TIMED_OUT) {
       noteRenderTimeout(Date.now());
@@ -1166,6 +1223,7 @@ async function answerWithoutRender(
   staleHit: Response | undefined,
   impersonal: boolean,
   deadline: number,
+  signedIn = false,
 ): Promise<Response> {
   noteRenderTimeout(Date.now());
   let answer: Response | null = null;
@@ -1173,15 +1231,16 @@ async function answerWithoutRender(
   // The prerendered file first, when the page has one. For an impersonal request it is the very
   // page the render would have produced, from this deploy - it was only skipped on the way in if
   // the asset binding did not answer, so it is worth asking again. A deal page reached with
-  // `?return=`, or any baked page asked for by a signed-in reader, is personalized and never had a
+  // `?return=`, or a deal page asked for by a signed-in reader, is personalized and never had a
   // stored copy — but its prerendered file is the same page without the back link, the distances or
   // the reader's name in the header, which is far better than an error. Sent no-store then: it is
-  // standing in for a personal page, and must not be kept under that page's URL.
-  if (impersonal || isDocumentRequest(request, url)) {
+  // standing in for a personal page, and must not be kept under that page's URL. A signed-in reader
+  // of a page that reads nothing of them gets the shared copy marked for them, as a hit would.
+  if (impersonal || signedIn || isDocumentRequest(request, url)) {
     const baked = await prerenderedPage(request, env, new URL(url.pathname, url.origin)).catch(() => null);
     if (baked) {
-      if (!impersonal) baked.headers.set("Cache-Control", "no-store");
-      answer = baked;
+      if (!impersonal && !signedIn) baked.headers.set("Cache-Control", "no-store");
+      answer = signedIn ? await signedInCopy(baked) : baked;
       served = "the prerendered page";
     }
   }
@@ -1192,7 +1251,7 @@ async function answerWithoutRender(
     // up again, since another request may have stored a copy while this one waited.
     const stale = staleHit ?? (cache && cacheKey ? await cache.match(cacheKey).catch(() => undefined) : undefined);
     if (stale) {
-      answer = fromCache(stale, request);
+      answer = signedIn ? await signedInCopy(fromCache(stale, request)) : fromCache(stale, request);
       served = "the colo's cached copy";
     }
   }
@@ -1343,10 +1402,15 @@ const worker = {
     // protect capacity that only the expensive ones consume. The baked file first, then the colo's
     // copy, both found under the request's path alone (pageLookup).
     const lookup = internal ? null : pageLookup(request, url);
+    // Whether the request is answered with the page every reader of its address gets. A signed-in
+    // reader of a page that reads nothing of them is (pageLookup): the shared copy with the mark
+    // added (signedInCopy), and on a miss a render made as a signed-out reader's, which is stored
+    // for everyone and handed to them marked.
     const impersonal = lookup !== null;
+    const shared = (page: Response) => (lookup?.signedIn ? signedInCopy(page) : page);
     if (lookup) {
       const prerendered = await prerenderedPage(request, env, lookup.url);
-      if (prerendered) return withSecurityHeaders(prerendered, url);
+      if (prerendered) return withSecurityHeaders(await shared(prerendered), url);
     }
     const cache = edgeCache();
     const cacheKey = cache && lookup ? cacheKeyFor(lookup.url, env, request) : null;
@@ -1359,11 +1423,11 @@ const worker = {
         const age = Date.now() - Number(hit.headers.get(CACHED_AT_HEADER) || 0);
         if (hit.status === 404) {
           // A not-found page is served for its hour and then rendered again, never refreshed.
-          if (age < NOT_FOUND_KEEP_MS) return withSecurityHeaders(fromCache(hit, request), url);
+          if (age < NOT_FOUND_KEEP_MS) return withSecurityHeaders(await shared(fromCache(hit, request)), url);
           await hit.body?.cancel().catch(() => {});
         } else if (age < EDGE_CACHE_MAX_STALE_MS) {
           if (age >= EDGE_CACHE_FRESH_MS) refreshInBackground(request, env, ctx, lookup.url, cache, cacheKey, hit);
-          return withSecurityHeaders(fromCache(hit, request), url);
+          return withSecurityHeaders(await shared(fromCache(hit, request)), url);
         } else {
           staleHit = hit;
         }
@@ -1400,12 +1464,15 @@ const worker = {
       // what is stored for the next reader (see SERVER_READ_PARAMS). From here on `request` is that
       // bare request, with this one's method and headers; `url` is still the address as it was sent.
       if (lookup && !lookup.bare) request = new Request(lookup.url.toString(), request);
+      // A signed-in reader's miss is rendered as a signed-out reader's: the copy is for everyone,
+      // and RootShell would mark and personalize a render that saw the session cookie.
+      if (lookup?.signedIn) request = new Request(request, { headers: signedOutHeaders(request.headers) });
       const deadline = renderDeadlineMs(Date.now(), env.RENDER_DEADLINE_MS);
       let outcome = isWatchedRender(request, url)
         ? await withinDeadline(renderPage(request, env, ctx), deadline)
         : await renderPage(request, env, ctx);
       if (outcome === RENDER_TIMED_OUT) {
-        return await answerWithoutRender(request, env, url, cache, cacheKey, staleHit, impersonal, deadline);
+        return await answerWithoutRender(request, env, url, cache, cacheKey, staleHit, impersonal, deadline, lookup?.signedIn ?? false);
       }
       if (lookup && !lookup.bare) outcome = withQueryCarried(outcome, url.search);
       const response = outcome;
@@ -1428,7 +1495,7 @@ const worker = {
         ctx.waitUntil(storePage(cache, cacheKey, response.clone(), lookup.url).catch(() => {}));
       }
       // The same page a later cache hit or the prerendered file would be, so it is sent the same way.
-      return withSecurityHeaders(storable ? impersonalPage(response) : response, url);
+      return withSecurityHeaders(await shared(storable ? impersonalPage(response) : response), url);
     } finally {
       clearInterval(heartbeat);
       admission.release(requestId);

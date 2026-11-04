@@ -720,6 +720,7 @@ CREATE INDEX `idx_favorites_created` ON `favorites` (`created_at`);
 CREATE INDEX `idx_email_leads_created` ON `email_leads` (`created_at`);
 CREATE INDEX `idx_suggestions_user_created` ON `suggestions` (`user_id`,`created_at`);
 CREATE INDEX `idx_reports_user_created` ON `reports` (`user_id`,`created_at`);
+CREATE INDEX idx_locations_geo ON restaurant_locations(latitude, longitude);
 CREATE TRIGGER `trg_deals_updated_at_insert` AFTER INSERT ON `deals` WHEN NEW.`updated_at`='1970-01-01 00:00:00' BEGIN UPDATE `deals` SET `updated_at`=CURRENT_TIMESTAMP WHERE `id`=NEW.`id`; END;
 CREATE TRIGGER `trg_suggestions_updated_at_insert` AFTER INSERT ON `suggestions` WHEN NEW.`updated_at`='1970-01-01 00:00:00' BEGIN UPDATE `suggestions` SET `updated_at`=CURRENT_TIMESTAMP WHERE `id`=NEW.`id`; END;
 CREATE TRIGGER trg_deals_deleted AFTER DELETE ON deals
@@ -810,59 +811,135 @@ CREATE TRIGGER `trg_audit_log_no_delete` BEFORE DELETE ON `audit_log`
 BEGIN
   SELECT RAISE(ABORT, 'audit_log is append-only');
 END;
+CREATE TRIGGER trg_deals_inserted AFTER INSERT ON deals
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'deals';
+END;
+CREATE TRIGGER trg_deals_updated AFTER UPDATE ON deals
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'deals';
+END;
+CREATE TRIGGER trg_restaurants_inserted AFTER INSERT ON restaurants
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'restaurants';
+END;
+CREATE TRIGGER trg_restaurants_updated AFTER UPDATE ON restaurants
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'restaurants';
+END;
+CREATE TRIGGER trg_restaurant_locations_inserted AFTER INSERT ON restaurant_locations
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'restaurant_locations';
+END;
+CREATE TRIGGER trg_restaurant_locations_updated AFTER UPDATE ON restaurant_locations
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'restaurant_locations';
+END;
+CREATE TRIGGER trg_deal_locations_inserted AFTER INSERT ON deal_locations
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'deal_locations';
+END;
+CREATE TRIGGER trg_deal_locations_updated AFTER UPDATE ON deal_locations
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'deal_locations';
+END;
+CREATE TRIGGER trg_deal_items_inserted AFTER INSERT ON deal_items
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'deal_items';
+END;
+CREATE TRIGGER trg_deal_items_updated AFTER UPDATE ON deal_items
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'deal_items';
+END;
+CREATE TRIGGER trg_deal_items_deleted AFTER DELETE ON deal_items
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'deal_items';
+END;
+CREATE TRIGGER trg_verification_events_inserted AFTER INSERT ON verification_events
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'verification_events';
+END;
+CREATE TRIGGER trg_verification_events_updated AFTER UPDATE ON verification_events
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'verification_events';
+END;
+CREATE TRIGGER trg_verification_events_deleted AFTER DELETE ON verification_events
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'verification_events';
+END;
+CREATE TRIGGER trg_staff_reminders_inserted AFTER INSERT ON staff_reminders
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'staff_reminders';
+END;
+CREATE TRIGGER trg_staff_reminders_updated AFTER UPDATE ON staff_reminders
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'staff_reminders';
+END;
+CREATE TRIGGER trg_staff_reminders_deleted AFTER DELETE ON staff_reminders
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'staff_reminders';
+END;
+CREATE TRIGGER trg_favorites_inserted AFTER INSERT ON favorites
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'favorites';
+END;
+CREATE TRIGGER trg_favorites_deleted AFTER DELETE ON favorites
+BEGIN
+  UPDATE data_changes SET n = n + 1 WHERE name = 'favorites';
+END;
 
-INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','read_admin','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','create_deals','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','publish_deals','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','verify_deals','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','manage_sponsorships','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','manage_restaurant_photos','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','moderate_suggestions','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','moderate_feedback','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','manage_email','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','manage_users','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','read_admin','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','create_deals','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','publish_deals','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','verify_deals','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_sponsorships','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_restaurant_photos','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','moderate_suggestions','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','moderate_feedback','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_email','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_users','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('deal_editor','read_admin','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('deal_editor','create_deals','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('deal_editor','publish_deals','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('deal_editor','verify_deals','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('deal_editor','manage_restaurant_photos','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('moderator','read_admin','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('moderator','moderate_suggestions','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('moderator','moderate_feedback','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('marketing','read_admin','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('marketing','manage_email','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('marketing','manage_sponsorships','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('analyst','read_admin','2026-11-04 19:52:26');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','read_admin','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','create_deals','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','publish_deals','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','verify_deals','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','manage_restaurant_photos','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','moderate_suggestions','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','moderate_feedback','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','reopen_reports','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','view_analytics','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('finance_manager','read_admin','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('finance_manager','manage_finance','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('finance_manager','manage_sponsorships','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('finance_manager','view_analytics','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('developer','read_admin','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('developer','export_data','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('developer','developer_tools','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','reopen_reports','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','view_analytics','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_campaigns','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_finance','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('marketing','view_analytics','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('marketing','manage_campaigns','2026-11-04 19:52:50');
-INSERT INTO role_permissions(role,permission,created_at) VALUES('analyst','view_analytics','2026-11-04 19:52:50');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','read_admin','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','create_deals','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','publish_deals','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','verify_deals','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','manage_sponsorships','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','manage_restaurant_photos','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','moderate_suggestions','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','moderate_feedback','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','manage_email','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('owner','manage_users','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','read_admin','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','create_deals','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','publish_deals','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','verify_deals','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_sponsorships','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_restaurant_photos','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','moderate_suggestions','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','moderate_feedback','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_email','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_users','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('deal_editor','read_admin','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('deal_editor','create_deals','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('deal_editor','publish_deals','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('deal_editor','verify_deals','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('deal_editor','manage_restaurant_photos','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('moderator','read_admin','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('moderator','moderate_suggestions','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('moderator','moderate_feedback','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('marketing','read_admin','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('marketing','manage_email','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('marketing','manage_sponsorships','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('analyst','read_admin','2026-11-04 21:19:24');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','read_admin','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','create_deals','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','publish_deals','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','verify_deals','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','manage_restaurant_photos','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','moderate_suggestions','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','moderate_feedback','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','reopen_reports','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('supervisor','view_analytics','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('finance_manager','read_admin','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('finance_manager','manage_finance','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('finance_manager','manage_sponsorships','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('finance_manager','view_analytics','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('developer','read_admin','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('developer','export_data','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('developer','developer_tools','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','reopen_reports','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','view_analytics','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_campaigns','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('admin','manage_finance','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('marketing','view_analytics','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('marketing','manage_campaigns','2026-11-04 21:19:48');
+INSERT INTO role_permissions(role,permission,created_at) VALUES('analyst','view_analytics','2026-11-04 21:19:48');

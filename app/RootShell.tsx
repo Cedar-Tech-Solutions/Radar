@@ -66,9 +66,12 @@ export async function RootShell({ lang, children }: { lang: string; children: Re
   //
   // Cookie presence only - this decides what to download, never what anyone is allowed to do. The
   // token is still verified server-side on every request in app/auth.ts, so a forged cookie buys
-  // a bigger download and nothing else. It also lines up with the colo page cache, which refuses
-  // to store any response for a request carrying __session (see worker/index.ts): the cached copy
-  // is always the signed-out one, which is always the copy that omits Clerk.
+  // a bigger download and nothing else. It also lines up with the colo page cache, which never
+  // stores a render that saw __session (see worker/index.ts): the cached copy is always the
+  // signed-out one, which is always the copy that omits Clerk. A signed-in reader of a page that
+  // reads nothing else of them - the home page, the static pages, the city guides - is handed that
+  // copy with the data-signed-in mark below added by the Worker (signedInCopy), and the provider
+  // and HasSessionProvider read the mark once hydrated.
   //
   // The same fact picks the kind of link the site's pages render (HasSessionProvider below, read by
   // app/ChromeLink.tsx): plain page loads without the cookie, which the Worker answers from its

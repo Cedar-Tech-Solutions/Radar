@@ -17,9 +17,8 @@
 // deal with any other set of fields, in any other order, or holding an undefined, and that deal is
 // sent as the object it is, as every deal was before. A column added by a migration makes every
 // deal travel that way until it is added here - slower to parse, never wrong - and
-// tests/snapshot-rows.test.mjs fails until it is. Nationwide deals carry two more fields
-// (footprint_regions, participating_location_count) and always travel as objects; they were 80 of
-// 596.
+// tests/snapshot-rows.test.mjs fails until it is. Nationwide deals carry one more field
+// (footprint_regions) and always travel as objects; they were 80 of 596.
 //
 // Imports nothing, so the test can load it on its own.
 
@@ -37,7 +36,8 @@ export const ROW_FIELDS = [
   "service_style", "vertical", "latitude", "longitude", "timezone", "country",
   "region", "eligible_location_id", "neighborhood", "location_website", "schedule_days", "start_time",
   "end_time", "recurring", "save_count", "effective_verification_status", "under_review", "primary_city",
-  "chain_brand", "search_keywords", "indexed", "chain_location_count", "chain_locations",
+  "chain_brand", "search_keywords", "indexed", "search_text", "chain_location_count", "participating_location_count",
+  "chain_locations",
 ] as const;
 
 /** `base` as a row, or null when it is not exactly ROW_FIELDS and has to travel as it is. */
@@ -70,6 +70,7 @@ export function rowBase(r: readonly unknown[]): Record<string, unknown> | null {
     brand: r[54], service_style: r[55], vertical: r[56], latitude: r[57], longitude: r[58], timezone: r[59],
     country: r[60], region: r[61], eligible_location_id: r[62], neighborhood: r[63], location_website: r[64], schedule_days: r[65],
     start_time: r[66], end_time: r[67], recurring: r[68], save_count: r[69], effective_verification_status: r[70], under_review: r[71],
-    primary_city: r[72], chain_brand: r[73], search_keywords: r[74], indexed: r[75], chain_location_count: r[76], chain_locations: r[77],
+    primary_city: r[72], chain_brand: r[73], search_keywords: r[74], indexed: r[75], search_text: r[76], chain_location_count: r[77],
+    participating_location_count: r[78], chain_locations: r[79],
   };
 }

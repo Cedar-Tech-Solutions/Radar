@@ -74,49 +74,127 @@ test("the side queries return only the requested deals' rows on the real schema"
   assert.equal(db.prepare(sideQuery("deal_locations")).all(page).length, 3);
 });
 
-// The catalog cache (adminCatalog in the route): the deal list and the drink-rule check, kept per
-// isolate under a fingerprint of what they are built from.
-const catalogCache = route.slice(route.indexOf("const CATALOG_MAX_AGE_MS"), route.indexOf("export async function GET("));
+// The kept parts (workspaceParts in the route): the heaviest lists, kept per isolate as the strings
+// they were sent, under the change counters of the tables each is built from.
+const partsCache = route.slice(route.indexOf("const PART_MAX_AGE_MS"), route.indexOf("export async function GET("));
 const postHandler = route.slice(route.indexOf("export async function POST("));
 
-test("a workspace load takes the deal list and drink-rule check from the catalog cache", () => {
-  assert.match(getHandler, /loadAdminCatalog\(Date\.now\(\)\)/);
-  assert.doesNotMatch(getHandler, /DRINK_RULE_LIVE_SQL/, "the drink-rule read lives in the cache, not in every load");
-  assert.match(getHandler, /`\{"deals":\$\{catalog\.dealsJson\},"drinkRuleAlerts":\$\{catalog\.drinkRuleAlertsJson\},\$\{rest\.slice\(1\)\}`/);
-});
-
-test("the fingerprint is read before the catalog, so a copy is never older than its key", () => {
-  const load = catalogCache.slice(catalogCache.indexOf("async function loadAdminCatalog("));
-  const fingerprint = load.indexOf("await readCatalogRevision()");
-  assert.ok(fingerprint > 0 && fingerprint < load.indexOf("readAdminDeals("), "readCatalogRevision runs first");
-  assert.match(load, /kept\.revision === revision && now - kept\.readAt < CATALOG_MAX_AGE_MS/, "reused only for the same fingerprint, and never past the max age");
-});
-
-test("the fingerprint covers every table the catalog is built from", () => {
-  const sql = catalogCache.slice(catalogCache.indexOf("async function readCatalogRevision("), catalogCache.indexOf("async function loadAdminCatalog("));
-  for (const table of ["deals", "restaurants", "restaurant_locations", "deal_locations"]) {
-    assert.ok(sql.includes(`MAX(updated_at) FROM ${table})`), `edits to ${table}`);
-    assert.ok(sql.includes(`MAX(rowid) FROM ${table})`), `inserts into ${table}`);
+function workspaceParts() {
+  const table = partsCache.slice(partsCache.indexOf("const WORKSPACE_PARTS = {"), partsCache.indexOf("} as const"));
+  const parts = new Map();
+  for (const match of table.matchAll(/^\s+(\w+): \{ tables: \[([^\]]*)\]/gm)) {
+    parts.set(match[1], [...match[2].matchAll(/"([^"]+)"/g)].map((entry) => entry[1]));
   }
-  for (const table of ["deal_items", "verification_events", "audit_log"]) assert.ok(sql.includes(`MAX(rowid) FROM ${table})`), `appends to ${table}`);
-  assert.ok(sql.includes("FROM data_changes"), "deletes, schedules and search terms");
+  assert.ok(parts.size >= 7, `expected the workspace's parts, got ${[...parts.keys()].join(", ")}`);
+  return parts;
+}
+
+test("a workspace load takes every heavy list from the kept parts", () => {
+  const parts = workspaceParts();
+  for (const name of ["deals", "drinkRuleAlerts", "draftReview", "reviewQueue", "restaurants", "staffReminders", "coverageTree"]) {
+    assert.ok(parts.has(name), `${name} is a kept part`);
+    assert.match(getHandler, new RegExp(`wanted\\("${name}"`), `${name} is read only when its kept copy is out of date`);
+    assert.match(getHandler, new RegExp(`part\\("${name}"`), `${name} is sent from its kept copy`);
+  }
+  assert.match(getHandler, /`\{"deals":\$\{dealsJson\},"drinkRuleAlerts":\$\{drinkRuleAlertsJson\},"draftReview":\$\{draftReviewJson\},"reviewQueue":\$\{reviewQueueJson\},"restaurants":\$\{restaurantsJson\},"staffReminders":\$\{staffRemindersJson\},"coverageTree":\$\{coverageTreeJson\},\$\{rest\.slice\(1\)\}`/);
 });
 
-test("a workspace action drops this isolate's copy before it writes anything", () => {
-  const forget = postHandler.indexOf("forgetAdminCatalog();");
-  assert.ok(forget > 0, "POST forgets the catalog");
-  assert.ok(forget < postHandler.indexOf("env.DB.prepare("), "before the first write");
+test("the counters are read before the parts, so a copy is never older than its key", () => {
+  const counters = getHandler.indexOf("await readChangeCounters(db)");
+  assert.ok(counters > 0 && counters < getHandler.indexOf("await Promise.all(["), "readChangeCounters runs first, on its own");
+  assert.match(partsCache, /kept\.counters === key && now - kept\.readAt < WORKSPACE_PARTS\[name\]\.maxAgeMs/, "reused only under the same counters, and never past the max age");
+  assert.match(partsCache, /if \(n === undefined\) return null;/, "a table with no counter keeps nothing");
 });
 
-test("the fingerprint query runs on the real schema and moves when a deal is sponsored", () => {
+// Every read goes through app/d1-reads.ts, which sends the statements issued together as one
+// batch: a load used to be sixty-odd D1 statements, each a subrequest of the fifty a Worker on the
+// free plan may make in one invocation.
+test("the workspace reads D1 through the batching collector", () => {
+  assert.match(getHandler, /const db = collectReads\(env\.DB\);/);
+  const loadOnly = getHandler.slice(0, getHandler.indexOf("async function handleHasHistory("));
+  assert.doesNotMatch(loadOnly, /env\.DB\.prepare\(/, "no read goes out on its own");
+  for (const helper of ["async function buildCreatorRoster(", "async function buildGrowthMetrics(", "async function readAdminDeals("]) {
+    const body = route.slice(route.indexOf(helper), route.indexOf("\n}\n", route.indexOf(helper)));
+    assert.doesNotMatch(body, /env\.DB\.prepare\(/, `${helper} reads through the collector it is handed`);
+  }
+});
+
+function freshSchema() {
   const db = new DatabaseSync(":memory:");
   for (const file of readdirSync(new URL("../drizzle/", import.meta.url)).filter((name) => name.endsWith(".sql")).sort()) {
     db.exec(readFileSync(new URL(`../drizzle/${file}`, import.meta.url), "utf8"));
   }
-  const sql = [...catalogCache.matchAll(/"((?:SELECT| )[^"]*)"/g)].map((match) => match[1]).filter((part) => part.includes("MAX(") || part.includes("data_changes") || part.startsWith("SELECT")).join("");
-  const read = () => JSON.stringify(db.prepare(sql).get());
-  const before = read();
-  // What the sponsorship action does: an UPDATE that leaves updated_at alone, then its audit row.
-  db.exec("INSERT INTO audit_log(actor_id,actor_role,action,target_type,target_id,details) VALUES('u','owner','sponsorship','deal','d','{}')");
-  assert.notEqual(read(), before);
+  return db;
+}
+
+// What makes the counters the truth: a trigger on every write to every table a part reads. A write
+// path a counter does not see - the sponsored flag and a status change leave updated_at alone,
+// which is why the old fingerprint read the audit log - would leave a kept part stale for its max
+// age. An insert, an update and a delete each move the table's counter on the real schema.
+test("every table a part is built from is counted on every write", () => {
+  const db = freshSchema();
+  const counter = (table) => db.prepare("SELECT n FROM data_changes WHERE name=?").get(table)?.n;
+  const seed = {
+    restaurants: () => db.exec("INSERT INTO restaurants(id,name,cuisine,slug) VALUES('r1','Chain','Burgers','chain')"),
+    restaurant_locations: () => db.exec("INSERT INTO restaurant_locations(id,restaurant_id,address,city,postal_prefix,timezone,slug) VALUES('l1','r1','1 Main St','Ottawa','K1A','America/Toronto','chain-1')"),
+    deals: () => db.exec("INSERT INTO deals(id,slug,restaurant_id,location_id,restaurant,title,category,cuisine,schedule,city,postal_prefix,address,price,emoji,source_url) VALUES('d1','d1','r1','l1','Chain','Deal','Food','Burgers','Mon 3-6 PM','Ottawa','K1A','1 Main St','$9','🍔','https://example.com')"),
+    deal_locations: () => db.exec("INSERT INTO deal_locations(deal_id,location_id,eligibility) VALUES('d1','l1','confirmed')"),
+    deal_schedules: () => db.exec("INSERT INTO deal_schedules(deal_id,display_text,timezone,days,start_time,end_time) VALUES('d1','Mon 3-6 PM','America/Toronto','[\"mon\"]','15:00','18:00')"),
+    deal_items: () => db.exec("INSERT INTO deal_items(deal_id,name,discounted_price,sort_order) VALUES('d1','Wings','$9',0)"),
+    search_terms: () => db.exec("INSERT INTO search_terms(entity_type,entity_id,term,weight,source) VALUES('deal','d1','wings',1,'curated')"),
+    verification_events: () => db.exec("INSERT INTO verification_events(deal_id,status,method,source_url,verified_by) VALUES('d1','verified','source','https://example.com','u')"),
+    staff_reminders: () => db.exec("INSERT INTO staff_reminders(id,kind,deal_id,basis,details) VALUES('s1','new_draft','d1','research','{}')"),
+    market_coverage: () => db.exec("INSERT INTO market_coverage(market,region,country,status,minimum_offers) VALUES('Testville','ON','CA','covered',3)"),
+    favorites: () => db.exec("INSERT INTO favorites(user_id,deal_id) VALUES('u1','d1')"),
+  };
+  const touch = {
+    restaurants: () => db.exec("UPDATE restaurants SET name='Chain!' WHERE id='r1'"),
+    restaurant_locations: () => db.exec("UPDATE restaurant_locations SET city='Gatineau' WHERE id='l1'"),
+    // The writes the old fingerprint could not see: a status change, a verification, the sponsored flag.
+    deals: () => { db.exec("UPDATE deals SET status='paused',active=0 WHERE id='d1'"); db.exec("UPDATE deals SET sponsored=1 WHERE id='d1'"); },
+    deal_locations: () => db.exec("UPDATE deal_locations SET eligibility='excluded' WHERE deal_id='d1'"),
+    deal_schedules: () => db.exec("UPDATE deal_schedules SET end_time='19:00' WHERE deal_id='d1'"),
+    deal_items: () => db.exec("UPDATE deal_items SET name='Wings!' WHERE deal_id='d1'"),
+    search_terms: () => db.exec("UPDATE search_terms SET weight=2 WHERE entity_id='d1'"),
+    verification_events: () => db.exec("UPDATE verification_events SET notes='x' WHERE deal_id='d1'"),
+    staff_reminders: () => db.exec("UPDATE staff_reminders SET status='done' WHERE id='s1'"),
+    market_coverage: () => db.exec("UPDATE market_coverage SET status='limited' WHERE market='Testville'"),
+    favorites: () => {},
+  };
+  const remove = {
+    favorites: () => db.exec("DELETE FROM favorites WHERE deal_id='d1'"),
+    staff_reminders: () => db.exec("DELETE FROM staff_reminders WHERE id='s1'"),
+    verification_events: () => db.exec("DELETE FROM verification_events WHERE deal_id='d1'"),
+    deal_items: () => db.exec("DELETE FROM deal_items WHERE deal_id='d1'"),
+    search_terms: () => db.exec("DELETE FROM search_terms WHERE entity_id='d1'"),
+    deal_schedules: () => db.exec("DELETE FROM deal_schedules WHERE deal_id='d1'"),
+    deal_locations: () => db.exec("DELETE FROM deal_locations WHERE deal_id='d1'"),
+    market_coverage: () => db.exec("DELETE FROM market_coverage WHERE market='Testville'"),
+    deals: () => db.exec("DELETE FROM deals WHERE id='d1'"),
+    restaurant_locations: () => db.exec("DELETE FROM restaurant_locations WHERE id='l1'"),
+    restaurants: () => db.exec("DELETE FROM restaurants WHERE id='r1'"),
+  };
+  const tables = new Set([...workspaceParts().values()].flat());
+  for (const table of tables) assert.ok(table in seed, `this test knows how to write ${table}`);
+  const moved = (table, write, what) => {
+    const before = counter(table);
+    assert.ok(Number.isInteger(before), `${table} has a counter`);
+    write();
+    assert.ok(counter(table) > before, `${what} ${table} moves its counter`);
+  };
+  for (const table of Object.keys(seed)) moved(table, seed[table], "an insert into");
+  for (const table of Object.keys(touch)) if (table !== "favorites") moved(table, touch[table], "an update to");
+  for (const table of Object.keys(remove)) moved(table, remove[table], "a delete from");
+});
+
+test("a workspace action moves a counter, and the reload that follows rebuilds only what it touched", () => {
+  assert.doesNotMatch(postHandler, /forgetAdminCatalog\(\)/, "nothing is dropped blind before a write any more");
+  const parts = workspaceParts();
+  // A reminder marked done is a staff_reminders write: the reminders and the draft review (which
+  // carries each draft's research note) are rebuilt; the inventory is not.
+  const feeds = (table) => [...parts].filter(([, tables]) => tables.includes(table)).map(([name]) => name).sort();
+  assert.deepEqual(feeds("staff_reminders"), ["draftReview", "staffReminders"]);
+  assert.deepEqual(feeds("favorites"), ["reviewQueue"]);
+  assert.ok(!parts.get("reviewQueue").includes("product_events"), "clicks never wait on a counter; the queue is refreshed by time");
+  assert.match(partsCache, /reviewQueue: \{ tables: \[[^\]]*\], maxAgeMs: REVIEW_QUEUE_MAX_AGE_MS \}/);
 });

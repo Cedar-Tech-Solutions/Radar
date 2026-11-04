@@ -115,7 +115,7 @@ test("the phone app's shape carries the counts too", () => {
 
 test("the route caps the page it returns, not everything that matched", () => {
   // Capping before paging would sort thousands of arrays to throw all but one page of them away.
-  assert.match(dealsRoute, /\.map\(\(deal\) => capDealLocations\(deal as Record<string, unknown>, point\) as typeof deal\)/);
+  assert.match(dealsRoute, /return capDealLocations\(deal as Record<string, unknown>, point\) as typeof deal;/);
   assert.match(dealsRoute, /filtered\.slice\(offset,offset\+limit\)/);
 });
 

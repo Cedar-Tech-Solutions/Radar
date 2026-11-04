@@ -4,6 +4,7 @@ import type { ClerkProviderProps } from "@clerk/react";
 import { createContext, lazy, useContext, useEffect, useState, type ComponentType } from "react";
 import { localizedPath } from "./locale-path";
 import { loadClerkReact } from "./clerk-react";
+import { documentIsSignedIn } from "./has-session";
 
 // @clerk/react itself - the React bindings, not Clerk's hosted script - is a 120 KB chunk (31 KB
 // gzipped), and as a static import here and in SiteHeader it was preloaded and parsed on every page
@@ -79,9 +80,11 @@ const ClerkMounted = createContext(false);
  * thing the browser does, and for a signed-out reader all of it is wasted: the only Clerk component
  * a public page renders is the <UserButton/> in the header, which signed-out readers never see.
  *
- * So it loads for signed-in readers (RootShell passes `active` when the session cookie is present)
- * and on the two pages whose whole job is signing in. Everyone else — every crawler, every visitor
- * from search, every reader browsing deals — gets none of it.
+ * So it loads for signed-in readers (RootShell passes `active` when the session cookie is present,
+ * and the Worker marks <html data-signed-in> on the shared copy of a page it hands a signed-in
+ * reader - see signedInCopy in worker/index.ts - which is read here once hydrated) and on the two
+ * pages whose whole job is signing in. Everyone else — every crawler, every visitor from search,
+ * every reader browsing deals — gets none of it.
  *
  * Nothing about auth changes: the session cookie is what it always was, the server still verifies
  * it on every request in app/auth.ts, and SiteHeader reads /api/session for its own state rather
@@ -89,7 +92,7 @@ const ClerkMounted = createContext(false);
  */
 export default function ClerkClientProvider({
   children,
-  active = true,
+  active: activeByRender = true,
   locale,
 }: {
   children: React.ReactNode;
@@ -98,6 +101,15 @@ export default function ClerkClientProvider({
   locale?: string;
 }) {
   const alreadyMounted = useContext(ClerkMounted);
+  // The Worker's mark, read after hydration so the first client render matches the server's HTML,
+  // which was rendered for a signed-out reader. Clerk's chunk is already on its way by then
+  // (app/clerk-react.ts reads the same mark at module evaluation).
+  const [marked, setMarked] = useState(false);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reading the document after hydration
+    if (!activeByRender && documentIsSignedIn()) setMarked(true);
+  }, [activeByRender]);
+  const active = activeByRender || marked;
   const [isDark, setIsDark] = useState(true);
   // Kept with the locale it was loaded for, so switching language never shows the old one.
   const [loaded, setLoaded] = useState<{ locale: string; resource: LocalizationResource } | null>(null);

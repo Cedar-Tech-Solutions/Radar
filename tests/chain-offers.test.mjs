@@ -153,7 +153,7 @@ test("the lead is chosen from the offers that pass the request's filters", () =>
   const declared = route.indexOf("const offerMatches = (deal: NormalizedDeal) =>");
   assert.ok(declared > -1 && declared < route.indexOf("const grouped = Array.from("), "the predicate must exist before the grouping");
   const predicate = route.slice(declared, route.indexOf(";", declared));
-  for (const clause of ["matchesQuery(", "categories.some(", "priceTiers.has(", "offerRunsOn(weekday", "startTime", "endTime", "deal.available_now", "effective_verification_status", "drinkVerdict(deal)", "sponsored === \"true\""]) {
+  for (const clause of ["matchesNormalizedQuery(", "categories.some(", "priceTiers.has(", "offerRunsOn(weekday", "startTime", "endTime", "deal.available_now", "effective_verification_status", "drinkVerdict(deal)", "sponsored === \"true\""]) {
     assert.ok(predicate.includes(clause), `${clause} describes an offer, so it belongs in offerMatches`);
   }
   assert.match(route, /return !!source && offerMatches\(source\)/, "candidates are judged by their own deal row");

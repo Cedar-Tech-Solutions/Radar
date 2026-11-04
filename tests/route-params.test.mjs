@@ -405,8 +405,9 @@ const REQUEST_READS = {
   // The country, for the currency. /pro is never baked, and the colo keeps it once per currency
   // bucket (cacheKeyFor in worker/index.ts; currencyBucket in app/pricing.ts).
   "app/[locale]/pro/page.tsx": ["headers:CF-IPCountry"],
-  // Whether a session cookie is present. isSignedIn in worker/index.ts keeps every request carrying
-  // one out of the bake and the colo cache.
+  // Whether a session cookie is present. The Worker never stores a render that saw one, and on the
+  // pages that read nothing else of the reader (USER_BLIND_ROUTES, below) it hands a signed-in
+  // reader the shared copy with RootShell's mark added instead (signedInCopy in worker/index.ts).
   "app/RootShell.tsx": ["cookies:__session"],
   // A bearer token or the session cookie: isSignedIn again. The creator referral cookies are read
   // only once a token has verified, for a new account's referral - never for a request the Worker
@@ -548,6 +549,59 @@ function middlewareFiles(entry) {
   }
   return [...seen];
 }
+
+// The reads every page shares, which cannot tell one reader from another at an address: the host,
+// the Worker's own Turnstile key, and RootShell's cookie check, whose only effect on the page is the
+// mark the Worker adds itself for a signed-in reader (signedInCopy in worker/index.ts).
+const SHARED_READS = new Set(["headers:host", "headers:x-turnstile-site-key", "cookies:__session"]);
+
+function userBlindRoutes() {
+  const source = readFileSync(path.join(ROOT, "worker", "index.ts"), "utf8");
+  const match = source.match(/^const USER_BLIND_ROUTES = new Set\(\[(.*)\]\);/m);
+  assert.ok(match, "expected USER_BLIND_ROUTES in worker/index.ts");
+  return [...match[1].matchAll(/"([^"]*)"/g)].map((entry) => entry[1]);
+}
+
+/** The page and the layouts around it, for a route in SERVER_READ_PARAMS's terms. */
+function routeFiles(route) {
+  const dir = path.join(LOCALE_TREE, ...route.split("/").filter(Boolean));
+  const page = ["page.tsx", "page.ts", "page.jsx", "page.js"].map((name) => path.join(dir, name)).find((file) => existsSync(file));
+  assert.ok(page, `no page for route "${route}" under app/[locale]`);
+  const files = [page];
+  for (let at = dir; at.startsWith(LOCALE_TREE); at = path.dirname(at)) {
+    for (const name of ["layout.tsx", "layout.ts", "template.tsx"]) if (existsSync(path.join(at, name))) files.push(path.join(at, name));
+  }
+  return files;
+}
+
+// A signed-in reader of these pages is handed the page every reader gets (pageLookup in
+// worker/index.ts), so nothing their render can reach may read the request in a way that tells
+// readers apart: no bearer token, no cookie but RootShell's, no header but the shared ones. A page
+// that starts to read who is signed in - as the deal page does, for the reader's saved postal code -
+// has to leave the list.
+test("a page in USER_BLIND_ROUTES reads nothing of its reader", () => {
+  const routes = userBlindRoutes();
+  assert.ok(routes.includes("") && routes.includes("terms"), "the home and static pages are user-blind");
+  for (const route of routes) {
+    const seen = new Set();
+    const queue = routeFiles(route);
+    while (queue.length) {
+      const file = queue.pop();
+      if (seen.has(file)) continue;
+      seen.add(file);
+      queue.push(...runtimeImports(file));
+    }
+    for (const file of seen) {
+      const { reads } = requestReads(file);
+      for (const read of reads) {
+        assert.ok(SHARED_READS.has(read), `route "${route}" reaches ${rel(file)}, which reads ${read}: a signed-in reader is handed the shared page, so it must not read the reader - take the route out of USER_BLIND_ROUTES in worker/index.ts or move the read`);
+      }
+    }
+  }
+  // And the deal page, which reads the reader's saved postal code through getAppUser, is not listed.
+  assert.ok(!routes.includes("deals/[slug]"), "the deal page reads who is signed in");
+  assert.ok(!routes.includes("pro"), "/pro reads who is signed in");
+});
 
 test("every request header next-intl's middleware reads is accounted for, and the forwarded ones never reach it", () => {
   const proxy = readFileSync(path.join(ROOT, "proxy.ts"), "utf8");

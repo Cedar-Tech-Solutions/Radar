@@ -79,7 +79,7 @@ test("personalized locale pages are excluded from the cache, bar the bare sign-i
 // render reads (SERVER_READ_PARAMS, held to the pages by tests/route-params.test.mjs); what is not
 // in it is ignored for the lookup, and a route that is not in it refuses every query, so a page
 // added later fails closed.
-test("page lookup refuses flights, signed-in readers and the parameters a route's server render reads", () => {
+test("page lookup refuses flights, signed-in readers of personal pages and the parameters a route's server render reads", () => {
   const source = worker();
   const flight = bodyOf(source, "function isFlightRequest");
   assert.match(flight, /headers\.has\("RSC"\)/);
@@ -91,11 +91,13 @@ test("page lookup refuses flights, signed-in readers and the parameters a route'
   assert.match(signedIn, /headers\.has\("authorization"\)/, "getAppUser reads a bearer token before the cookie");
   const lookup = bodyOf(source, "function pageLookup");
   assert.match(lookup, /request\.method !== "GET" && request\.method !== "HEAD"/);
-  assert.match(lookup, /if \(isFlightRequest\(request, url\) \|\| isSignedIn\(request\)\) return null;/);
-  assert.match(lookup, /if \(!url\.search\) return \{ url, bare: true \};/);
+  assert.match(lookup, /if \(isFlightRequest\(request, url\)\) return null;/);
+  assert.match(lookup, /if \(signedIn && \(route === null \|\| !USER_BLIND_ROUTES\.has\(route\)\)\) return null;/,
+    "a signed-in reader is shared only the pages that read nothing of them (held to the pages by tests/route-params.test.mjs)");
+  assert.match(lookup, /if \(!url\.search\) return \{ url, bare: true, signedIn \};/);
   assert.match(lookup, /if \(!read\) return null;/, "a route missing from the table refuses any query");
   assert.match(lookup, /if \(read\.includes\(key\)\) return null;/, "a parameter the render reads makes the request personal");
-  assert.match(lookup, /return \{ url: new URL\(url\.pathname, url\.origin\), bare: false \};/, "everything else is looked up as the bare address");
+  assert.match(lookup, /return \{ url: new URL\(url\.pathname, url\.origin\), bare: false, signedIn \};/, "everything else is looked up as the bare address");
 });
 
 function serverReadParams() {
@@ -252,5 +254,5 @@ test("a not-found page is stored for an hour, never under /deals/", () => {
   assert.match(bodyOf(source, "function notFoundIsStorable"), /CACHEABLE_LOCALES\.has\(segments\[0\]\) && segments\[1\] !== "deals"/);
   assert.match(bodyOf(source, "function storableResponse"), /response\.status === 404 \? NOT_FOUND_KEEP_MS : EDGE_CACHE_KEEP_MS/);
   const handler = source.slice(source.indexOf("async fetch(request: Request, env: Env, ctx: ExecutionContext)"));
-  assert.match(handler, /if \(hit\.status === 404\) \{\s*if \(age < NOT_FOUND_KEEP_MS\) return withSecurityHeaders\(fromCache\(hit, request\), url\);/);
+  assert.match(handler, /if \(hit\.status === 404\) \{\s*if \(age < NOT_FOUND_KEEP_MS\) return withSecurityHeaders\(await shared\(fromCache\(hit, request\)\), url\);/);
 });

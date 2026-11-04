@@ -1,10 +1,12 @@
-// A national chain in the deals snapshot: held once per brand, drawn per request.
+// A national chain in the deals snapshot: its branches carried per shard, its totals measured once.
 //
-// Drives the built worker against a real SQLite database made from drizzle/*.sql, with a brand large
-// enough to take the large-brand path (LARGE_BRAND_MIN_BRANCHES) and a small Canadian chain beside
-// it that must not. The things asserted are the ones a reader sees: how many locations a card says,
-// which branch it names, how far away that is, and that a second isolate reading the colo's copy of
-// the snapshot answers exactly as the first one did.
+// Drives the built worker against a real SQLite database made from drizzle/*.sql, with a brand of
+// four hundred branches in two states and a small Canadian chain beside it. A map cell's shard
+// carries the branches within reach of the cell and a country's shard a sample per state
+// (BRANCHES_PER_REGION), while the totals a card states are counted over every branch in D1. The
+// things asserted are the ones a reader sees: how many locations a card says, which branch it names,
+// how far away that is, and that a second isolate reading the colo's copy of the snapshot answers
+// exactly as the first one did.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { registerHooks } from "node:module";
@@ -174,12 +176,15 @@ test("a reader in Morristown reaches the Morristown branch", async () => {
   assert.ok(!card(body, "Poutine Place"), "and an Ottawa chain is not");
 });
 
-test("a named state draws only that state's branches", async () => {
+test("a named state shows only that state's branches", async () => {
+  // Answered from the country's shard, whose sample has branches in both states; the card shows
+  // the Tennessee ones.
   const body = await first(`/api/deals?province=TN`);
   const brand = card(body);
-  assert.ok(brand);
+  assert.ok(brand, "the brand has a branch in Tennessee");
   assert.ok(brand.chain_locations.length > 0 && brand.chain_locations.every((location) => location.region === "TN"));
   assert.equal(brand.chain_location_count, 401, "the total is still the brand's");
+  assert.ok(!card(await first(`/api/deals?province=ON`), "Burger Brand"), "and not in Ontario");
 });
 
 test("a per-branch promotion on a large brand counts only its confirmed branches", async () => {

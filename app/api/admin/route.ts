@@ -15,6 +15,7 @@ import { requestPayout } from "../../affiliate-payouts";
 import { normalizeReferralCode, resolveReferralCode } from "../../referral-code";
 import { resolveRejectionReason } from "../../suggestion-review";
 import { REVIEW_QUEUE_SQL, buildReviewQueue, type ReviewQueueRow } from "../../review-queue";
+import { collectReads, type CollectedReads } from "../../d1-reads";
 import { CLEAR_STAFF_REMINDERS_SQL, OPEN_STAFF_REMINDERS_SQL, type StaffReminder } from "../../staff-reminders";
 import {
   DRAFT_ARCHIVE_SQL, DRAFT_AUDIT_SQL, DRAFT_BATCH_READ_SQL, DRAFT_CONFIRM_LOCATIONS_SQL, DRAFT_INSERT_SCHEDULES_SQL,
@@ -204,20 +205,20 @@ async function notifyCreatorDecision(input: { email: string; approved: boolean; 
  * handle. The money stays split by currency for the same reason it is everywhere else: Radar Pro
  * is sold in several and a single total across them would be a number that is wrong in all of them.
  */
-async function buildCreatorRoster() {
+async function buildCreatorRoster(db: CollectedReads) {
   const [profiles, visits, signups, money, campaigns, picks] = await Promise.all([
-    env.DB.prepare("SELECT user_id,handle,display_name,status,commission_rate_bps FROM creator_profiles ORDER BY handle")
+    db.prepare("SELECT user_id,handle,display_name,status,commission_rate_bps FROM creator_profiles ORDER BY handle")
       .all<{ user_id: string; handle: string; display_name: string | null; status: string; commission_rate_bps: number }>(),
-    env.DB.prepare(
+    db.prepare(
       `SELECT json_extract(properties,'$.creator') handle,COUNT(*) visits,
               COALESCE(SUM(created_at>=datetime('now','-30 days')),0) visits30
          FROM product_events
         WHERE type='campaign_visit' AND json_extract(properties,'$.creator') IS NOT NULL
         GROUP BY handle`,
     ).all<{ handle: string; visits: number; visits30: number }>(),
-    env.DB.prepare("SELECT referred_by handle,COUNT(*) signups FROM users WHERE referred_by IS NOT NULL GROUP BY referred_by")
+    db.prepare("SELECT referred_by handle,COUNT(*) signups FROM users WHERE referred_by IS NOT NULL GROUP BY referred_by")
       .all<{ handle: string; signups: number }>(),
-    env.DB.prepare(
+    db.prepare(
       `SELECT handle,currency,COUNT(*) invoices,
               COALESCE(SUM(CASE WHEN status='pending' THEN commission_amount ELSE 0 END),0) owed,
               COALESCE(SUM(CASE WHEN status='paid' THEN commission_amount ELSE 0 END),0) paid
@@ -226,7 +227,7 @@ async function buildCreatorRoster() {
     // The per-video breakdown. Visits and subscriptions for one label have to come from two
     // different tables, so they are unioned into one shape here rather than joined — a campaign
     // that brought visits and no subscribers still has to appear, and so does the reverse.
-    env.DB.prepare(
+    db.prepare(
       `SELECT handle,campaign,SUM(visits) visits,SUM(subscriptions) subscriptions,SUM(earned) earned,MAX(currency) currency FROM (
          SELECT json_extract(properties,'$.creator') handle,json_extract(properties,'$.creatorCampaign') campaign,
                 COUNT(*) visits,0 subscriptions,0 earned,NULL currency
@@ -243,7 +244,7 @@ async function buildCreatorRoster() {
     // Radar's name on a page Radar serves. Staff need to be able to read what is out there
     // without going creator by creator, and to take one down. LEFT JOIN so a pick pointing at a
     // pulled deal still appears here - that is precisely the row somebody may want to remove.
-    env.DB.prepare(
+    db.prepare(
       `SELECT p.handle,p.deal_id,p.note,p.position,p.created_at,d.restaurant,d.title,d.status,d.active,d.deleted_at
          FROM creator_picks p LEFT JOIN deals d ON d.id=p.deal_id
         ORDER BY p.handle,p.position`,
@@ -302,7 +303,7 @@ async function buildCreatorRoster() {
  * Every money figure stays split by currency. Radar Pro is sold in several and a single total
  * across them is a number that is wrong in all of them.
  */
-async function buildGrowthMetrics(canSeeMoney: boolean) {
+async function buildGrowthMetrics(db: CollectedReads, canSeeMoney: boolean) {
   const money = <T,>(run: () => Promise<{ results: T[] }>) => (canSeeMoney ? run() : Promise.resolve({ results: [] as T[] }));
   const [
     revenue,
@@ -320,7 +321,7 @@ async function buildGrowthMetrics(canSeeMoney: boolean) {
     // Money actually collected, from the invoice_paid events the Stripe webhook writes. Not
     // derived from a headcount: the users table cannot tell a monthly subscriber from an annual
     // one, so any figure built from it would be wrong for every yearly plan.
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT json_extract(properties,'$.currency') currency,COUNT(*) invoices,
               COALESCE(SUM(json_extract(properties,'$.amount')),0) total,
               COALESCE(SUM(CASE WHEN created_at>=datetime('now','-30 days') THEN json_extract(properties,'$.amount') ELSE 0 END),0) last30
@@ -328,19 +329,19 @@ async function buildGrowthMetrics(canSeeMoney: boolean) {
     ).all<{ currency: string; invoices: number; total: number; last30: number }>()),
     // `invoices` is what the finance panel charts (one line per day, any currency); without it
     // the "Invoices paid" sparkline summed undefined and drew nothing.
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT date(created_at) day,json_extract(properties,'$.currency') currency,
               COALESCE(SUM(json_extract(properties,'$.amount')),0) amount,COUNT(*) invoices
          FROM product_events WHERE type='invoice_paid' AND created_at>=datetime('now','-30 days')
         GROUP BY day,currency ORDER BY day`,
     ).all<{ day: string; currency: string; amount: number; invoices: number }>()),
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT type,date(created_at) day,COUNT(*) count
          FROM product_events
         WHERE type IN ('subscription_started','subscription_canceled') AND created_at>=datetime('now','-30 days')
         GROUP BY type,day ORDER BY day`,
     ).all<{ type: string; day: string; count: number }>()),
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT COALESCE(SUM(type='subscription_started'),0) started,
               COALESCE(SUM(type='subscription_canceled'),0) canceled,
               COALESCE(SUM(type='subscription_started' AND created_at>=datetime('now','-30 days')),0) started30,
@@ -350,7 +351,7 @@ async function buildGrowthMetrics(canSeeMoney: boolean) {
     // The affiliate program in one row. referred_pro is the number that matters: signups a
     // creator brought are interesting, signups that went on to pay are the deal working. A comp
     // is not one of those, so it asks who is paying (paidForPredicate) and not only who has Pro.
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT (SELECT COUNT(*) FROM creator_profiles) creators,
               (SELECT COUNT(*) FROM creator_profiles WHERE status='active') active_creators,
               (SELECT COUNT(*) FROM creator_applications WHERE status='pending') pending_applications,
@@ -362,7 +363,7 @@ async function buildGrowthMetrics(canSeeMoney: boolean) {
     // Program-wide payables, as a total rather than the per-handle split the roster already
     // carries. `gross` is what those invoices were worth to Radar, so the two can be read against
     // each other - what the program cost, next to what it brought in.
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT currency,COUNT(*) invoices,
               COALESCE(SUM(CASE WHEN status='pending' THEN commission_amount ELSE 0 END),0) pending,
               COALESCE(SUM(CASE WHEN status='paid' THEN commission_amount ELSE 0 END),0) paid,
@@ -373,21 +374,21 @@ async function buildGrowthMetrics(canSeeMoney: boolean) {
     // Why people said they were leaving. `while_failing` separates the answers given by somebody
     // whose card had already been declined: those are usually a billing problem wearing a
     // cancellation's clothes, and counting them as "too expensive" would point at the wrong fix.
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT reason,COUNT(*) total,
               COALESCE(SUM(plan_status='past_due'),0) while_failing,
               MAX(created_at) last_seen
          FROM cancellation_reasons GROUP BY reason ORDER BY total DESC`,
     ).all<{ reason: string; total: number; while_failing: number; last_seen: string }>()),
     // The free-text half, most recent first. Read by a person, never grouped.
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT reason,detail,created_at FROM cancellation_reasons
         WHERE detail IS NOT NULL AND detail<>'' ORDER BY created_at DESC LIMIT 20`,
     ).all<{ reason: string; detail: string; created_at: string }>()),
     // Comped accounts, so "who has Pro without paying for it" has an answer on the same screen.
     // Only grants still in force: one past its date gives nothing (the billing job has taken the
     // Pro back), and it stays unrevoked, since nobody revoked it.
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT g.id,g.user_id,u.email,g.reason,g.expires_at,g.created_at
          FROM plan_grants g JOIN users u ON u.id=g.user_id
         WHERE g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at >= date('now'))
@@ -396,13 +397,13 @@ async function buildGrowthMetrics(canSeeMoney: boolean) {
     // Did the offer work? Grouped by reason and offer, because the answer differs by both: a pause
     // offered to somebody who said "taking a break" is a very different proposition from the same
     // pause offered to somebody who said "too expensive".
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT reason,offer,COUNT(*) offered,COALESCE(SUM(accepted),0) accepted
          FROM save_offers GROUP BY reason,offer ORDER BY offered DESC`,
     ).all<{ reason: string; offer: string; offered: number; accepted: number }>()),
     // The state of the book right now: who is paused, who is on trial, who is inside their payment
     // grace period. Three numbers that are each a different kind of "not currently paying".
-    money(() => env.DB.prepare(
+    money(() => db.prepare(
       `SELECT (SELECT COUNT(*) FROM users WHERE paused_until IS NOT NULL AND paused_until > datetime('now')) paused,
               (SELECT COUNT(*) FROM users WHERE plan_status='trialing') trialing,
               (SELECT COUNT(*) FROM users WHERE trial_used=1) trials_started,
@@ -701,8 +702,8 @@ async function syncDealSponsoredFlag(dealId: string) {
 // skips them (app/api/deals/route.ts) and the deal page lists a brand's branches from the brand -
 // and the editor's per-address list is no way to look at ten thousand branches. Its editor falls
 // back to the deal's own address, the same as a deal saved before deal_locations existed.
-async function readAdminDeals(where: string, bindings: string[]): Promise<AdminDealRow[]> {
-  const { results: rows } = await env.DB.prepare(
+async function readAdminDeals(db: CollectedReads, where: string, bindings: string[]): Promise<AdminDealRow[]> {
+  const { results: rows } = await db.prepare(
     `SELECT d.*,r.name canonical_restaurant,r.service_style,l.timezone,l.latitude,l.longitude,l.full_postal,l.region location_region,COALESCE(l.country,r.country) location_country,(SELECT COUNT(*) FROM verification_events v WHERE v.deal_id=d.id) verification_count,(SELECT group_concat(term,', ') FROM search_terms st WHERE st.entity_type='deal' AND st.entity_id=d.id AND st.source='curated') curated_keywords,(SELECT group_concat(term,', ') FROM search_terms st WHERE st.entity_type='restaurant' AND st.entity_id=d.restaurant_id) restaurant_keywords,(SELECT COUNT(*) FROM deal_schedules s WHERE s.deal_id=d.id) schedules,(SELECT COUNT(*) FROM deal_locations dl WHERE dl.deal_id=d.id AND dl.eligibility='confirmed') confirmed_locations,(SELECT s.days FROM deal_schedules s WHERE s.deal_id=d.id ORDER BY s.id LIMIT 1) schedule_days,(SELECT s.start_time FROM deal_schedules s WHERE s.deal_id=d.id ORDER BY s.id LIMIT 1) schedule_start,(SELECT s.end_time FROM deal_schedules s WHERE s.deal_id=d.id ORDER BY s.id LIMIT 1) schedule_end FROM deals d LEFT JOIN restaurants r ON r.id=d.restaurant_id LEFT JOIN restaurant_locations l ON l.id=d.location_id WHERE d.deleted_at IS NULL${where} ORDER BY d.sponsored DESC,d.city,d.restaurant LIMIT 500`,
   ).bind(...bindings).all<AdminDealRow>();
   if (!rows.length) return rows;
@@ -711,13 +712,13 @@ async function readAdminDeals(where: string, bindings: string[]): Promise<AdminD
   const pageIds = JSON.stringify(rows.map((deal) => deal.id));
   const branchIds = JSON.stringify(rows.filter((deal) => deal.location_scope !== "brand" && deal.location_scope !== "national").map((deal) => deal.id));
   const [windowRows, locationRows, itemRows] = await Promise.all([
-    env.DB.prepare(
+    db.prepare(
       "SELECT deal_id,days,start_time,end_time FROM deal_schedules WHERE deal_id IN (SELECT value FROM json_each(?)) ORDER BY deal_id,id",
     ).bind(pageIds).all<{ deal_id: string; days: string; start_time: string; end_time: string }>(),
-    env.DB.prepare(
+    db.prepare(
       "SELECT dl.deal_id,l.id,l.address,l.city,l.postal_prefix,l.full_postal,dl.eligibility FROM deal_locations dl JOIN restaurant_locations l ON l.id=dl.location_id WHERE dl.deal_id IN (SELECT value FROM json_each(?)) ORDER BY dl.deal_id,dl.id",
     ).bind(branchIds).all<{ deal_id: string; id: string; address: string; city: string; postal_prefix: string; full_postal: string | null; eligibility: string }>(),
-    env.DB.prepare(
+    db.prepare(
       "SELECT deal_id,id,name,original_price,discounted_price FROM deal_items WHERE deal_id IN (SELECT value FROM json_each(?)) ORDER BY deal_id,sort_order",
     ).bind(pageIds).all<{ deal_id: string; id: number; name: string; original_price: string | null; discounted_price: string }>(),
   ]);
@@ -749,90 +750,76 @@ async function readAdminDeals(where: string, bindings: string[]): Promise<AdminD
   return rows;
 }
 
-// The catalog half of the workspace, kept by this isolate between requests.
+// The workspace's heaviest lists, kept by this isolate between requests, each already serialised.
 //
-// The deal list (up to 500 rows with their windows, locations and items) and the drink-rule check
-// over every live deal are the same for every staff member and the largest, most CPU-hungry part
-// of a workspace load. They were read from D1, parsed, checked and serialised again on every load
-// and after every action, though most actions - a reminder done, a report closed, a role changed,
-// a setting flipped - change none of it. Now each isolate keeps the last answer, already
-// serialised, under a fingerprint of the tables it is built from, and a load reads the
-// fingerprint (one row, the same shape as readRevision() in app/api/deals/route.ts) and reuses the
-// answer when nothing moved.
+// The deal inventory (up to 500 rows with their windows, locations and items), the draft review,
+// the restaurants, the open reminders, the review queue and the coverage tree are the same for
+// every staff member who may see them, and together they are nearly all of a workspace load -
+// 1.85 MB of the 1.9 MB a load sent, measured locally - and over a hundred milliseconds of CPU to
+// read out of D1 and serialise again: on every load, and on the reload after every action, for
+// lists that mostly had not changed. The deal list alone used to be kept, under a fingerprint of
+// MAX(updated_at) over its tables and the audit log's last row, which every action moves: the
+// reload after each one rebuilt the whole inventory.
 //
-// The fingerprint is read before the catalog, never after: a write landing between the two leaves
-// rows newer than their fingerprint, which costs one extra read on the next load, where the other
-// order could keep an edit out of the workspace. What it covers:
-//   deals, restaurants, restaurant_locations, deal_locations  MAX(updated_at) and MAX(rowid), with
-//                                                             deletes counted by data_changes
-//   deal_schedules, search_terms                              data_changes, bumped on every write
-//   deal_items, verification_events                           MAX(rowid): items are only ever
-//                                                             replaced by save_deal, which also moves
-//                                                             deals.updated_at; checks are appended
-//   audit_log                                                 MAX(rowid): every workspace action and
-//                                                             every cron step that edits deals writes
-//                                                             its audit row after its change, which
-//                                                             covers the few UPDATEs that leave
-//                                                             updated_at alone (the sponsored flag)
-// The isolate that takes a workspace action also drops its copy outright (forgetAdminCatalog).
-// CATALOG_MAX_AGE_MS is the backstop for a write path none of that sees, such as a hand edit in the
-// D1 console: no copy is reused past it. Filtered deal searches are never cached; they are small.
-// Kept in memory only, never in a shared cache: it holds internal notes, and the isolate is the one
-// place it cannot leak from.
-const CATALOG_MAX_AGE_MS = 5 * 60_000;
-type AdminCatalog = {
-  revision: string;
-  readAt: number;
-  deals: AdminDealRow[];
-  dealsJson: string;
-  drinkRuleAlertsJson: string;
-};
-let adminCatalog: AdminCatalog | null = null;
+// Each isolate now keeps the last answer for each part, as the string it sent, under the change
+// counters of the tables the part is built from: data_changes, one counter per table, moved by a
+// trigger on every write (drizzle/0049, 0140). A load reads the counters - one small row set,
+// before anything else - and reuses every part whose tables have not moved. An action rebuilds the
+// parts its tables feed and no other: a reminder marked done rebuilds the reminders, not the
+// inventory.
+//
+// The counters are read before the parts, never after: a write landing between the two leaves
+// rows newer than their counters, which costs one extra read on the next load, where the other
+// order could keep an edit out of the workspace. PART_MAX_AGE_MS is the backstop for a write the
+// counters do not see - a table with no trigger, which no part reads (tests/admin-workspace-cost
+// .test.mjs holds each part's tables to the migrations), or a hand edit through a path that has
+// one. The review queue's click counts come from product_events, which clicks move constantly and
+// which no part may wait on, so that part is refreshed by time alone (REVIEW_QUEUE_MAX_AGE_MS).
+// Kept in memory only, never in a shared cache: the inventory holds internal notes, and the isolate
+// is the one place it cannot leak from. What the viewer may see is decided per request, after.
+const PART_MAX_AGE_MS = 5 * 60_000;
+const REVIEW_QUEUE_MAX_AGE_MS = 60_000;
+const WORKSPACE_PARTS = {
+  deals: { tables: ["deals", "restaurants", "restaurant_locations", "deal_locations", "deal_items", "verification_events", "deal_schedules", "search_terms"], maxAgeMs: PART_MAX_AGE_MS },
+  drinkRuleAlerts: { tables: ["deals", "restaurants", "restaurant_locations", "deal_locations", "deal_schedules"], maxAgeMs: PART_MAX_AGE_MS },
+  draftReview: { tables: ["deals", "restaurants", "restaurant_locations", "deal_locations", "deal_schedules", "staff_reminders", "market_coverage"], maxAgeMs: PART_MAX_AGE_MS },
+  reviewQueue: { tables: ["deals", "restaurants", "favorites", "verification_events", "market_coverage"], maxAgeMs: REVIEW_QUEUE_MAX_AGE_MS },
+  restaurants: { tables: ["restaurants"], maxAgeMs: PART_MAX_AGE_MS },
+  staffReminders: { tables: ["staff_reminders", "deals"], maxAgeMs: PART_MAX_AGE_MS },
+  coverageTree: { tables: ["deals", "restaurants", "restaurant_locations"], maxAgeMs: PART_MAX_AGE_MS },
+} as const satisfies Record<string, { tables: readonly string[]; maxAgeMs: number }>;
+type WorkspacePart = keyof typeof WORKSPACE_PARTS;
+const keptParts = new Map<WorkspacePart, { counters: string; readAt: number; json: string }>();
 
-async function readCatalogRevision(): Promise<string> {
-  const row = await env.DB.prepare(
-    "SELECT (SELECT MAX(updated_at) FROM deals) d," +
-      " (SELECT MAX(updated_at) FROM restaurants) r," +
-      " (SELECT MAX(updated_at) FROM restaurant_locations) l," +
-      " (SELECT MAX(updated_at) FROM deal_locations) e," +
-      " (SELECT MAX(rowid) FROM deals) dn," +
-      " (SELECT MAX(rowid) FROM restaurants) rn," +
-      " (SELECT MAX(rowid) FROM restaurant_locations) ln," +
-      " (SELECT MAX(rowid) FROM deal_locations) en," +
-      " (SELECT MAX(rowid) FROM deal_items) inn," +
-      " (SELECT MAX(rowid) FROM verification_events) vn," +
-      " (SELECT MAX(rowid) FROM audit_log) an," +
-      " (SELECT group_concat(name||'='||n,'.') FROM data_changes) x",
-  ).first<Record<string, string | number | null>>();
-  return ["d", "r", "l", "e", "dn", "rn", "ln", "en", "inn", "vn", "an", "x"].map((key) => row?.[key] ?? "").join("|");
+async function readChangeCounters(db: CollectedReads): Promise<Map<string, number>> {
+  const { results } = await db.prepare("SELECT name,n FROM data_changes").all<{ name: string; n: number }>();
+  return new Map(results.map((row) => [row.name, Number(row.n)]));
 }
 
-/** The cached catalog when nothing it is built from has changed, otherwise a fresh one. */
-async function loadAdminCatalog(now: number): Promise<AdminCatalog> {
-  const revision = await readCatalogRevision();
-  const kept = adminCatalog;
-  if (kept && kept.revision === revision && now - kept.readAt < CATALOG_MAX_AGE_MS) return kept;
-  const [deals, drinkRuleRows] = await Promise.all([
-    readAdminDeals("", []),
-    // Every live deal, read against the drink-advertising rules where it runs (app/drink-rules.ts):
-    // deals published before a rule existed, or whose branches moved, are found here.
-    env.DB.prepare(DRINK_RULE_LIVE_SQL).all<DrinkRuleRow & { city: string; emoji: string }>(),
-  ]);
-  const fresh: AdminCatalog = {
-    revision,
-    readAt: now,
-    deals,
-    dealsJson: JSON.stringify(deals),
-    drinkRuleAlertsJson: JSON.stringify(buildDrinkRuleAlerts(drinkRuleRows.results || [])),
+/** The kept parts a load may reuse under these counters, and how to keep the ones it rebuilds. */
+function workspaceParts(counters: Map<string, number>, now: number) {
+  const keyOf = (name: WorkspacePart): string | null => {
+    const key: string[] = [];
+    for (const table of WORKSPACE_PARTS[name].tables) {
+      const n = counters.get(table);
+      // A table with no counter cannot say when it changed, and a part built from it is not kept.
+      if (n === undefined) return null;
+      key.push(`${table}=${n}`);
+    }
+    return key.join(".");
   };
-  adminCatalog = fresh;
-  return fresh;
-}
-
-/** Forgets the cached catalog. Every write the workspace makes calls it, so this isolate never
- * shows its own staff member a page from before their save, whatever the fingerprint says. */
-function forgetAdminCatalog() {
-  adminCatalog = null;
+  return {
+    reuse(name: WorkspacePart): string | null {
+      const kept = keptParts.get(name);
+      const key = keyOf(name);
+      return kept && key !== null && kept.counters === key && now - kept.readAt < WORKSPACE_PARTS[name].maxAgeMs ? kept.json : null;
+    },
+    keep(name: WorkspacePart, json: string): string {
+      const key = keyOf(name);
+      if (key !== null) keptParts.set(name, { counters: key, readAt: now, json });
+      return json;
+    },
+  };
 }
 
 export async function GET(request: Request) {
@@ -866,6 +853,9 @@ export async function GET(request: Request) {
   // invisible to plain client-side filtering of the loaded page — these let the admin workspace
   // ask the full table for a specific keyword/status/city/cuisine instead of only what happened
   // to load.
+  // Every read below goes out in a handful of batches rather than a statement each: see
+  // app/d1-reads.ts, and the fifty-subrequest limit it exists for.
+  const db = collectReads(env.DB);
   const searchParams = new URL(request.url).searchParams;
   const dealQ = searchParams.get("deal_q")?.trim() || "";
   const dealStatus = searchParams.get("deal_status")?.trim() || "";
@@ -899,9 +889,16 @@ export async function GET(request: Request) {
   // The deal search asks for the deal list and reads nothing else from the answer, so that is all
   // it gets: it runs on every pause in typing, and used to run all forty-odd workspace reads each
   // time to throw everything but the deals away.
-  if (dealConditions.length) return Response.json({ deals: await readAdminDeals(dealWhere, dealBindings) });
+  if (dealConditions.length) return Response.json({ deals: await readAdminDeals(db, dealWhere, dealBindings) });
+  // Which of the kept parts this load may reuse (workspaceParts). The counters are read on their
+  // own, ahead of everything they vouch for.
+  const now = Date.now();
+  const parts = workspaceParts(await readChangeCounters(db), now);
+  const wanted = (name: WorkspacePart, allowed: boolean) => allowed && parts.reuse(name) === null;
+  const none = <T,>(): Promise<{ results: T[] }> => Promise.resolve({ results: [] as T[] });
   const [
-    catalog,
+    deals,
+    drinkRuleRows,
     suggestions,
     users,
     feedback,
@@ -937,19 +934,23 @@ export async function GET(request: Request) {
     restaurantLeaderboard,
     dealChangeRequests,
   ] = await Promise.all([
-    loadAdminCatalog(Date.now()),
-    gated(canModerateSuggestions, () => env.DB.prepare("SELECT * FROM suggestions ORDER BY created_at DESC LIMIT 250").all()),
+    // The inventory and the drink-rule check over every live deal (app/drink-rules.ts: deals
+    // published before a rule existed, or whose branches moved, are found there), read only when
+    // the kept copies are out of date.
+    wanted("deals", true) ? readAdminDeals(db, "", []) : Promise.resolve(null),
+    wanted("drinkRuleAlerts", true) ? db.prepare(DRINK_RULE_LIVE_SQL).all<DrinkRuleRow & { city: string; emoji: string }>() : none<DrinkRuleRow & { city: string; emoji: string }>(),
+    gated(canModerateSuggestions, () => db.prepare("SELECT * FROM suggestions ORDER BY created_at DESC LIMIT 250").all()),
     // Hidden accounts are filtered in SQL, not in the client, so a hidden row never reaches a
     // browser that is not allowed to see it. The gate is the owner/admin role rather than a
     // permission: a custom role can be granted manage_users, and the whole point of hiding an
     // account is that holding that permission is not by itself enough to see it.
-    gated(canManageUsers || canManageEmail, () => env.DB.prepare(
+    gated(canManageUsers || canManageEmail, () => db.prepare(
       `SELECT id,email,name,role,status,hidden,home_postal,alerts_enabled,alert_days,alert_time,language,timezone,country,distance_unit,plan,plan_status,created_at,referred_by FROM users${isAdminPlus ? "" : " WHERE hidden=0"} ORDER BY created_at DESC LIMIT 500`,
     ).all()),
     // Open and reviewing first, so a pile of resolved items can never push live work past the
     // limit. The deal title is for feedback sent from a deal's page; the resolver's name is who to
     // ask about a resolved item.
-    gated(canModerateFeedback, () => env.DB.prepare(
+    gated(canModerateFeedback, () => db.prepare(
       `SELECT f.id,f.type,f.message,f.status,f.priority,f.market,f.email,f.page,f.deal_id,f.resolution,f.resolved_at,f.created_at,
               d.title deal_title,d.restaurant deal_restaurant,u.name resolved_by_name
        FROM feedback f LEFT JOIN deals d ON d.id=f.deal_id LEFT JOIN users u ON u.id=f.resolved_by
@@ -958,12 +959,12 @@ export async function GET(request: Request) {
     // The Audit log tab pages through GET /api/admin/audit; nothing in the workspace payload
     // reads the log any more, so it is not sent with every load.
     Promise.resolve({ results: [] as Record<string, unknown>[] }),
-    env.DB.prepare("SELECT * FROM restaurants ORDER BY name LIMIT 500").all(),
+    wanted("restaurants", true) ? db.prepare("SELECT * FROM restaurants ORDER BY name LIMIT 500").all() : none(),
     // Each report with the deal it questions and where that is: the reported branch when the reader
     // named one, else the deal's own branch. A brand-wide or national deal with no branch named has
     // no single place, so it gets none rather than its representative branch's city. Open and
     // reviewing come first so completed reports never push live ones past the limit.
-    gated(canModerateFeedback, () => env.DB.prepare(
+    gated(canModerateFeedback, () => db.prepare(
       `SELECT r.id,r.category,r.notes,r.status,r.priority,r.deal_id,r.location_id,r.source_url,r.resolution,r.resolved_at,r.created_at,
               d.title deal_title,d.restaurant deal_restaurant,d.status deal_status,d.location_scope,
               CASE WHEN r.location_id IS NULL AND d.location_scope IN ('brand','national') THEN NULL ELSE COALESCE(l.city,d.city) END city,
@@ -978,9 +979,9 @@ export async function GET(request: Request) {
        LEFT JOIN users u ON u.id=r.resolved_by
        ORDER BY CASE r.status WHEN 'open' THEN 0 WHEN 'reviewing' THEN 1 ELSE 2 END,CASE r.priority WHEN 'high' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 100`,
     ).all()),
-    env.DB.prepare("SELECT * FROM market_coverage ORDER BY country,region,market").all<MarketCoverageRow>(),
-    gated(canManageEmail, () => env.DB.prepare("SELECT user_id,email,status,consented_at,revoked_at,policy_version,created_at FROM email_consents ORDER BY created_at DESC LIMIT 250").all()),
-    gated(canManageEmail, () => env.DB.prepare("SELECT email,reason,created_at FROM email_suppressions ORDER BY created_at DESC LIMIT 250").all()),
+    db.prepare("SELECT * FROM market_coverage ORDER BY country,region,market").all<MarketCoverageRow>(),
+    gated(canManageEmail, () => db.prepare("SELECT user_id,email,status,consented_at,revoked_at,policy_version,created_at FROM email_consents ORDER BY created_at DESC LIMIT 250").all()),
+    gated(canManageEmail, () => db.prepare("SELECT email,reason,created_at FROM email_suppressions ORDER BY created_at DESC LIMIT 250").all()),
     // The pilot waitlist, oldest request first. created_at is when they actually joined; the
     // autoincrement id breaks ties for two requests landing in the same second. Every place
     // this queue is ordered uses the same pair so the position staff see and the position the
@@ -989,36 +990,36 @@ export async function GET(request: Request) {
     // joined before duplicate requests were deduped can still carry an older waitlisted row
     // underneath a later pending/confirmed one, and those are not waiting for anything — this
     // matches how consentFor() reads a person's current status.
-    gated(canManageEmail, () => env.DB.prepare(
+    gated(canManageEmail, () => db.prepare(
       `SELECT c.id,c.user_id,c.email,c.language,c.created_at,u.name
        FROM email_consents c LEFT JOIN users u ON u.id=c.user_id
        WHERE c.status='waitlisted'
          AND c.id=(SELECT id FROM email_consents WHERE user_id=c.user_id ORDER BY id DESC LIMIT 1)
        ORDER BY c.created_at,c.id LIMIT 250`,
     ).all<{id:number;user_id:string;email:string;language:string;created_at:string;name:string|null}>()),
-    gated(canManageSponsorships, () => env.DB.prepare("SELECT * FROM sponsorships ORDER BY starts_at DESC LIMIT 100").all()),
-    gated(canManageUsers, () => env.DB.prepare(
+    gated(canManageSponsorships, () => db.prepare("SELECT * FROM sponsorships ORDER BY starts_at DESC LIMIT 100").all()),
+    gated(canManageUsers, () => db.prepare(
       "SELECT m.*,u.email user_email,u.name user_name FROM restaurant_managers m LEFT JOIN users u ON u.id=m.user_id WHERE m.status<>'revoked' ORDER BY m.created_at DESC LIMIT 250",
     ).all()),
-    gated(canSeeCampaigns, () => env.DB.prepare(
+    gated(canSeeCampaigns, () => db.prepare(
       "SELECT json_extract(properties,'$.source') source,json_extract(properties,'$.campaign') campaign,market,COUNT(*) hits,MIN(created_at) first_seen,MAX(created_at) last_seen FROM product_events WHERE type='campaign_visit' GROUP BY source,campaign,market ORDER BY hits DESC LIMIT 200",
     ).all()),
     // The Roles & permissions grid is read by owners and admins (Admin tab) and edited by the
     // owner alone (set_role_permission).
-    gated(isAdminPlus, () => env.DB.prepare("SELECT role,permission FROM role_permissions").all<{role:string;permission:string}>()),
+    gated(isAdminPlus, () => db.prepare("SELECT role,permission FROM role_permissions").all<{role:string;permission:string}>()),
     // Sits behind the same gate as the user list itself: it is a per-account attribute, useless
     // without the row it belongs to, and never larger than the number of creator accounts.
-    gated(canManageUsers || canManageFinance, () => env.DB.prepare("SELECT user_id,handle,display_name,status,commission_rate_bps FROM creator_profiles ORDER BY handle").all<{user_id:string;handle:string;display_name:string|null;status:string;commission_rate_bps:number}>()),
+    gated(canManageUsers || canManageFinance, () => db.prepare("SELECT user_id,handle,display_name,status,commission_rate_bps FROM creator_profiles ORDER BY handle").all<{user_id:string;handle:string;display_name:string|null;status:string;commission_rate_bps:number}>()),
     // Pending first, then the recently decided ones, so the queue reads as work and the rest as
     // history without needing two round trips.
-    gated(canManageFinance, () => env.DB.prepare(
+    gated(canManageFinance, () => db.prepare(
       `SELECT id,user_id,email,requested_handle,channel_url,audience,pitch,status,rejection_reason,created_at,reviewed_at
          FROM creator_applications ORDER BY (status='pending') DESC,created_at DESC LIMIT 200`,
     ).all<Record<string,unknown>>()),
     // The payables queue. Undecided first for the same reason. `payout_id` rides along because
     // it is what decides whether a row can still be touched by hand: one a payout is carrying is
     // not staff's to move.
-    gated(canManageFinance, () => env.DB.prepare(
+    gated(canManageFinance, () => db.prepare(
       `SELECT id,handle,invoice_id,gross_amount,currency,rate_bps,commission_amount,status,created_at,paid_at,
               payout_id,approved_at,rejection_reason
          FROM creator_commissions ORDER BY (status='pending') DESC,created_at DESC LIMIT 200`,
@@ -1026,7 +1027,7 @@ export async function GET(request: Request) {
     // Money that has actually left, with the Stripe object behind each row. Newest first: this
     // is a record to check, not a queue to work through — the only thing anyone acts on here is
     // a failure, and those are recent by definition.
-    gated(canManageFinance, () => env.DB.prepare(
+    gated(canManageFinance, () => db.prepare(
       `SELECT id,handle,stripe_account_id,stripe_transfer_id,stripe_payout_id,amount,currency,status,
               commission_count,failure_reason,initiated_by,created_at,paid_at
          FROM creator_payouts ORDER BY created_at DESC LIMIT 200`,
@@ -1034,7 +1035,7 @@ export async function GET(request: Request) {
     // What each affiliate is owed and whether they can be paid it, in one row per currency. The
     // console's payout button needs both halves: an amount, and Stripe's answer about the
     // account it would go to.
-    gated(canManageFinance, () => env.DB.prepare(
+    gated(canManageFinance, () => db.prepare(
       `SELECT c.handle,c.currency,
               COALESCE(SUM(CASE WHEN c.status='approved' AND c.payout_id IS NULL THEN c.commission_amount ELSE 0 END),0) available,
               COALESCE(SUM(CASE WHEN c.status='pending' THEN c.commission_amount ELSE 0 END),0) holding,
@@ -1044,14 +1045,14 @@ export async function GET(request: Request) {
          FROM creator_commissions c LEFT JOIN creator_profiles p ON p.handle=c.handle
         GROUP BY c.handle,c.currency HAVING available>0 OR holding>0 ORDER BY available DESC`,
     ).all<Record<string,unknown>>()),
-    gated(isAdminPlus, () => env.DB.prepare("SELECT user_id,permission FROM user_permissions").all<{user_id:string;permission:string}>()),
+    gated(isAdminPlus, () => db.prepare("SELECT user_id,permission FROM user_permissions").all<{user_id:string;permission:string}>()),
     // Counted in SQL rather than over `deals.results`, because that list stops at 500 rows —
     // once the catalog outgrows a single page every overview figure would quietly start
     // under-reporting. Every lifecycle status is tallied so the six figures add up to `total`
     // instead of leaving paused and archived deals uncounted, and "stale" uses the same rule
     // the public API applies (only a *verified* deal goes stale; an unverified one is simply
     // unverified, and is already counted as such).
-    env.DB.prepare(
+    db.prepare(
       `SELECT COUNT(*) total,
         COALESCE(SUM(status='live'),0) live,
         COALESCE(SUM(status='draft'),0) draft,
@@ -1067,10 +1068,10 @@ export async function GET(request: Request) {
     // 30-day trend lines for the Overview tab's sparkline cards. One row per day that actually
     // had activity (not a zero-filled 30-row series) — the client fills the gaps, since that's
     // simpler than teaching SQLite to generate a calendar of dates it has no native support for.
-    gated(canManageUsers || canViewAnalytics, () => env.DB.prepare("SELECT date(created_at) day,COUNT(*) count FROM users WHERE created_at>=datetime('now','-30 days') GROUP BY day ORDER BY day").all<{day:string;count:number}>()),
-    env.DB.prepare("SELECT date(created_at) day,COUNT(*) count FROM deals WHERE created_at>=datetime('now','-30 days') AND deleted_at IS NULL GROUP BY day ORDER BY day").all<{day:string;count:number}>(),
-    gated(canViewAnalytics, () => env.DB.prepare("SELECT date(created_at) day,COUNT(*) count FROM product_events WHERE created_at>=datetime('now','-30 days') GROUP BY day ORDER BY day").all<{day:string;count:number}>()),
-    env.DB.prepare("SELECT COALESCE(SUM(json_extract(properties,'$.helpful')=1),0) helpful,COALESCE(SUM(json_extract(properties,'$.helpful')=0),0) not_helpful FROM product_events WHERE type='deal_feedback'").first<{helpful:number;not_helpful:number}>(),
+    gated(canManageUsers || canViewAnalytics, () => db.prepare("SELECT date(created_at) day,COUNT(*) count FROM users WHERE created_at>=datetime('now','-30 days') GROUP BY day ORDER BY day").all<{day:string;count:number}>()),
+    db.prepare("SELECT date(created_at) day,COUNT(*) count FROM deals WHERE created_at>=datetime('now','-30 days') AND deleted_at IS NULL GROUP BY day ORDER BY day").all<{day:string;count:number}>(),
+    gated(canViewAnalytics, () => db.prepare("SELECT date(created_at) day,COUNT(*) count FROM product_events WHERE created_at>=datetime('now','-30 days') GROUP BY day ORDER BY day").all<{day:string;count:number}>()),
+    db.prepare("SELECT COALESCE(SUM(json_extract(properties,'$.helpful')=1),0) helpful,COALESCE(SUM(json_extract(properties,'$.helpful')=0),0) not_helpful FROM product_events WHERE type='deal_feedback'").first<{helpful:number;not_helpful:number}>(),
     // Growth tab: subscription mix, counted in SQL for the same reason as dealTotals above — the
     // users list itself is capped at 500 rows. Deliberately excludes users.alerts_enabled: that
     // column is a legacy single-postal toggle (set by app/api/user/route.ts, cleared by
@@ -1081,7 +1082,7 @@ export async function GET(request: Request) {
     // Review's sandbox purchase, is real Pro and is nobody's subscription, so it has a number of its
     // own instead of passing for a customer. Headcounts, not money, so the Growth section's readers
     // (view_analytics) see them too; what anybody paid is in the finance metrics below.
-    gated(canManageUsers || canManageFinance || canViewAnalytics, () => env.DB.prepare(
+    gated(canManageUsers || canManageFinance || canViewAnalytics, () => db.prepare(
       `SELECT COUNT(*) total,
         COALESCE(SUM(plan='pro' AND plan_status='active' AND ${paidForPredicate}),0) pro_paying,
         COALESCE(SUM(plan='pro' AND plan_status='active' AND NOT ${paidForPredicate}),0) pro_not_paying,
@@ -1090,7 +1091,7 @@ export async function GET(request: Request) {
         COALESCE(SUM(plan_status='canceled'),0) pro_canceled
        FROM users`,
     ).all<UserTotals>()),
-    gated(canSeeEngagement, () => env.DB.prepare("SELECT COUNT(*) total FROM favorites").all<{total:number}>()),
+    gated(canSeeEngagement, () => db.prepare("SELECT COUNT(*) total FROM favorites").all<{total:number}>()),
     // The 30-day saves trend and the most-saved list moved to GET /api/admin/growth, which reads
     // them for the range the Growth section asks for (7, 30 or 90 days) instead of on every load.
     // DISTINCT user_id: a person can have several enabled notification_preferences rows (one per
@@ -1098,7 +1099,7 @@ export async function GET(request: Request) {
     // intentionally does NOT dedupe for that reason). This figure answers a different question,
     // "how many people are subscribed", so counting rows here would overstate the audience size
     // for anyone with more than one saved location's alerts turned on.
-    gated(canSeeEngagement, () => env.DB.prepare(
+    gated(canSeeEngagement, () => db.prepare(
       `SELECT (SELECT COUNT(*) FROM saved_locations WHERE active=1) saved_locations,
               (SELECT COUNT(DISTINCT user_id) FROM notification_preferences WHERE enabled=1) digest_subscribers`,
     ).all<{saved_locations:number;digest_subscribers:number}>()),
@@ -1113,7 +1114,7 @@ export async function GET(request: Request) {
     // recorded: both are counted under city '' (the client says "No city recorded" or names the
     // scope) rather than presented as a city. Grouped with the branch's province/state and country
     // so two cities sharing a name stay apart and the row can open the inventory filtered to it.
-    gated(canSeeEngagement, () => env.DB.prepare(
+    gated(canSeeEngagement, () => db.prepare(
       `SELECT CASE WHEN d.location_scope IN ('brand','national') OR TRIM(COALESCE(d.city,''))='' THEN '' ELSE d.city END city,
               CASE WHEN d.location_scope IN ('brand','national') THEN NULL ELSE l.region END region,
               CASE WHEN d.location_scope IN ('brand','national') THEN NULL ELSE COALESCE(l.country,r.country) END country,
@@ -1122,14 +1123,14 @@ export async function GET(request: Request) {
         WHERE d.status='live' AND d.active=1 AND d.deleted_at IS NULL
         GROUP BY 1,2,3 ORDER BY count DESC LIMIT 12`,
     ).all<{city:string;region:string|null;country:string|null;count:number}>()),
-    gated(canSeeEngagement, () => env.DB.prepare(
+    gated(canSeeEngagement, () => db.prepare(
       "SELECT restaurant,COUNT(*) count FROM deals WHERE status='live' AND active=1 AND deleted_at IS NULL GROUP BY restaurant ORDER BY count DESC LIMIT 10",
     ).all<{restaurant:string;count:number}>()),
     // Restaurant managers' edits waiting for staff, oldest first, each beside what the deal says
     // now: the reviewer judges the change against the live listing, and `previous` (the deal when
     // the edit was made) shows whether staff changed it in the meantime. Approving one writes deal
     // content, so it is read for the same grant that can.
-    gated(canCreateDeals, () => env.DB.prepare(
+    gated(canCreateDeals, () => db.prepare(
       `SELECT c.id,c.deal_id,c.restaurant_id,c.title,c.price,c.schedule,c.description,c.terms,c.previous,c.created_at,
               d.title current_title,d.price current_price,d.schedule current_schedule,d.description current_description,d.terms current_terms,
               d.status deal_status,d.city,r.name restaurant_name,u.email requester_email,u.name requester_name
@@ -1141,7 +1142,7 @@ export async function GET(request: Request) {
         ORDER BY c.created_at,c.id LIMIT 100`,
     ).all()),
   ]);
-  const [emptySearchMarkets, marketCounts] = await Promise.all([env.DB.prepare(
+  const [emptySearchMarkets, marketCounts] = await Promise.all([db.prepare(
     `SELECT market,COUNT(*) searches FROM product_events
       WHERE type='search' AND market IS NOT NULL AND json_extract(properties,'$.matches')=0
         AND created_at>=datetime('now','-90 days')
@@ -1149,7 +1150,7 @@ export async function GET(request: Request) {
   ).all<{ market: string; searches: number }>(),
     // Each launch market's counts over the whole catalog, not the 500 loaded deals, so they do
     // not quietly undercount once the catalog outgrows one page.
-    env.DB.prepare(
+    db.prepare(
       `SELECT m.market,COUNT(d.id) total,
               COALESCE(SUM(d.status='live' AND d.active=1),0) active_deals,
               COUNT(DISTINCT COALESCE(d.restaurant_id,d.restaurant)) unique_restaurants,
@@ -1175,23 +1176,23 @@ export async function GET(request: Request) {
   // why. The roster is gated whole because every column in it is either a person or their money;
   // the metrics block gates itself, since its deal and search halves are anonymous.
   const [creatorRoster, metrics, settings, reviewQueueRows, staffReminders, draftReview, approvals, staffDirectory, coverageTree] = await Promise.all([
-    canManageFinance ? buildCreatorRoster() : Promise.resolve([]),
-    canManageFinance ? buildGrowthMetrics(canManageFinance) : Promise.resolve(null),
+    canManageFinance ? buildCreatorRoster(db) : Promise.resolve([]),
+    canManageFinance ? buildGrowthMetrics(db, canManageFinance) : Promise.resolve(null),
     // Read for anyone who can open the workspace, written only by manage_users. A switch whose
     // state is invisible to half the staff is one somebody flips twice.
     readSettings(),
     // What to check next, read across the whole catalog rather than the 500 rows above, and ranked
     // in app/review-queue.ts. Anonymous counts only: no favorite or click names its user here.
-    gated(canWorkDeals, () => env.DB.prepare(REVIEW_QUEUE_SQL).all<ReviewQueueRow>()),
+    gated(wanted("reviewQueue", canWorkDeals), () => db.prepare(REVIEW_QUEUE_SQL).all<ReviewQueueRow>()),
     // Deals to renew or confirm, opened daily by the Worker's cron (app/staff-reminders.ts). Read for
     // everyone in the workspace; marking one done is verify_deals'.
-    gated(canWorkDeals, () => env.DB.prepare(OPEN_STAFF_REMINDERS_SQL).all<StaffReminder>()),
+    gated(wanted("staffReminders", canWorkDeals), () => db.prepare(OPEN_STAFF_REMINDERS_SQL).all<StaffReminder>()),
     // Every draft with the source note it was written from, for the draft review screen
     // (app/draft-review.ts). Internal notes are already in the deal list above for the same readers.
-    gated(canWorkDeals, () => env.DB.prepare(DRAFT_REVIEW_SQL).all<DraftReviewRow>()),
+    gated(wanted("draftReview", canWorkDeals), () => db.prepare(DRAFT_REVIEW_SQL).all<DraftReviewRow>()),
     // Requests for an owner's authorization: the owner sees every pending one and the recent
     // decisions; anyone else sees only their own.
-    env.DB.prepare(
+    db.prepare(
       `SELECT a.id,a.action,a.summary,a.requested_by,a.requested_role,a.reason,a.status,a.decided_by,a.decision_note,a.decided_at,a.result,a.created_at,
               u.name requester_name,u.email requester_email,d.name decider_name
          FROM owner_approvals a LEFT JOIN users u ON u.id=a.requested_by LEFT JOIN users d ON d.id=a.decided_by
@@ -1200,7 +1201,7 @@ export async function GET(request: Request) {
     ).bind(...(isOwner ? [] : [current.userId])).all<Record<string, unknown>>(),
     // The staff directory: everyone who can open this workspace, with their role. Names and roles
     // only - addresses are for the people who manage accounts (the Users tab).
-    env.DB.prepare(
+    db.prepare(
       `SELECT id,name,role,${canManageUsers ? "email," : ""}created_at FROM users
         WHERE status='active' AND hidden=0 AND role NOT IN ('user','creator','restaurant')
         ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 WHEN 'supervisor' THEN 2 ELSE 3 END,name LIMIT 300`,
@@ -1209,7 +1210,7 @@ export async function GET(request: Request) {
     // three characters of a Canadian code, the first three digits of a US ZIP). Read from each
     // deal's own branch, so a chain's brand-wide or national offer - which has no single place -
     // is counted separately instead of being filed under whichever branch happens to be primary.
-    gated(canWorkDeals || canViewAnalytics, () => env.DB.prepare(
+    gated(wanted("coverageTree", canWorkDeals || canViewAnalytics), () => db.prepare(
       `SELECT COALESCE(l.country,r.country,'') country,COALESCE(l.region,'') region,d.city city,
               UPPER(SUBSTR(REPLACE(COALESCE(l.full_postal,l.postal_prefix,''),' ',''),1,3)) postal_area,
               COUNT(*) deals,
@@ -1223,14 +1224,21 @@ export async function GET(request: Request) {
         GROUP BY 1,2,3,4 ORDER BY 1,2,3,4 LIMIT 2000`,
     ).all<{ country: string; region: string; city: string; postal_area: string; deals: number; live: number; drafts: number; restaurants: number; stale: number }>()),
   ]);
-  // The catalog's two parts go in already serialised (see adminCatalog), and the rest is
-  // serialised around them: their keys are left out below and spliced in front.
+  // The kept parts go in as strings - the one this load read and serialised, or the one kept from
+  // an earlier load (workspaceParts) - and the rest is serialised around them: their keys are left
+  // out below and spliced in front. A viewer who may not see a part gets its empty shape.
+  const part = (name: WorkspacePart, allowed: boolean, empty: unknown, build: () => unknown): string =>
+    !allowed ? JSON.stringify(empty) : parts.reuse(name) ?? parts.keep(name, JSON.stringify(build()));
+  const dealsJson = part("deals", true, [], () => deals || []);
+  const drinkRuleAlertsJson = part("drinkRuleAlerts", true, [], () => buildDrinkRuleAlerts(drinkRuleRows.results || []));
+  const draftReviewJson = part("draftReview", canWorkDeals, [], () => draftReview.results || []);
+  const reviewQueueJson = part("reviewQueue", canWorkDeals, buildReviewQueue([]), () => buildReviewQueue(reviewQueueRows.results || []));
+  const restaurantsJson = part("restaurants", true, [], () => restaurants.results || []);
+  const staffRemindersJson = part("staffReminders", canWorkDeals, [], () => staffReminders.results || []);
+  const coverageTreeJson = part("coverageTree", canWorkDeals || canViewAnalytics, [], () => coverageTree.results || []);
   const rest = JSON.stringify({
     currentUser: { id: current.userId, role: current.role, name: current.displayName, email: current.email, permissions: Array.from(current.permissions) },
     dealTotals,
-    reviewQueue: buildReviewQueue(reviewQueueRows.results || []),
-    staffReminders: staffReminders.results || [],
-    draftReview: draftReview.results || [],
     approvals: approvals.results || [],
     staffDirectory: staffDirectory.results || [],
     suggestions: suggestions.results,
@@ -1239,10 +1247,8 @@ export async function GET(request: Request) {
     users: (users.results as { email?: string | null }[]).map((row) => ({ ...row, isProtected: isProtectedOwner(row.email) })),
     feedback: feedback.results,
     audit: audit.results,
-    restaurants: restaurants.results,
     reports: reports.results,
     coverage: coverageRows,
-    coverageTree: coverageTree.results || [],
     consents: consents.results,
     suppressions: suppressions.results,
     waitlist: waitlist.results,
@@ -1291,7 +1297,7 @@ export async function GET(request: Request) {
         }
       : { deliveryReady: canManageEmail ? pilotGatesOpen() : false },
   });
-  return new Response(`{"deals":${catalog.dealsJson},"drinkRuleAlerts":${catalog.drinkRuleAlertsJson},${rest.slice(1)}`, {
+  return new Response(`{"deals":${dealsJson},"drinkRuleAlerts":${drinkRuleAlertsJson},"draftReview":${draftReviewJson},"reviewQueue":${reviewQueueJson},"restaurants":${restaurantsJson},"staffReminders":${staffRemindersJson},"coverageTree":${coverageTreeJson},${rest.slice(1)}`, {
     headers: { "content-type": "application/json" },
   });
 }
@@ -1313,8 +1319,8 @@ export async function POST(request: Request) {
   if (!signedIn) return apiError(401,"AUTH_REQUIRED","Sign in required.");
   if (!canAdminister(signedIn)) return apiError(403,"ADMIN_REQUIRED","Administrative access required.");
   if (!(await requireSameOrigin(request))) return apiError(403,"INVALID_ORIGIN","This request could not be verified.");
-  // Before any write, so the reload that follows every action never gets this isolate's old copy.
-  forgetAdminCatalog();
+  // No copy to forget before the writes: the reload that follows every action reads the change
+  // counters its writes move, and rebuilds the parts built from those tables (workspaceParts).
   const current = signedIn;
   let b:AdminActionBody;
   try { b = await readJson<AdminActionBody>(request,64_000); } catch { return apiError(400,"INVALID_REQUEST","The administrative request is invalid."); }

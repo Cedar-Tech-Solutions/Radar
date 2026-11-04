@@ -118,9 +118,11 @@ const DEAL = {
   updated_at: new Date().toISOString(),
 };
 
-// Answers the five queries buildSnapshot makes, and counts them. Anything it does not recognize
-// comes back empty rather than throwing, so an unrelated query added later fails loudly in the
-// assertion about counts rather than silently here.
+// Answers the queries a shard build makes, and counts them. Anything it does not recognize comes
+// back empty rather than throwing, so an unrelated query added later fails loudly in the assertion
+// about counts rather than silently here. It filters nothing: every shard - a map cell, a country,
+// the nationwide list - is answered with every deal, and the route's own per-request filters sort
+// them out, as they would a real shard that happened to hold the same rows.
 function fakeD1(revision = REVISION, data = { deals: [DEAL], branches: [] }) {
   const asked = [];
   const rowsFor = (sql) => {
@@ -134,21 +136,30 @@ function fakeD1(revision = REVISION, data = { deals: [DEAL], branches: [] }) {
     if (sql.includes("MAX(updated_at)")) return [{ d: revision, r: revision, l: revision }];
     return [];
   };
+  const prepare = (sql) => {
+    asked.push(sql);
+    const statement = {
+      sql,
+      bind: () => statement,
+      all: async () => ({ results: rowsFor(sql), success: true, meta: {} }),
+      first: async () => rowsFor(sql)[0] ?? null,
+      run: async () => ({ success: true }),
+    };
+    return statement;
+  };
   return {
     asked,
+    // The reads that build a shard: its deals (every shard starts with that one query), and the
+    // markets the meta shard reads. A read of deals by id is left out - the Saved tab's request is
+    // answered straight from D1 on purpose, held by nobody, so it says nothing about the snapshot.
     get snapshotQueries() {
-      return asked.filter((sql) => /FROM deals d LEFT JOIN restaurants|search_terms|market_coverage|deal_translations|restaurant_locations l ON/.test(sql)).length;
+      return asked.filter((sql) =>
+        (sql.includes("FROM deals d LEFT JOIN restaurants") && !sql.includes("d.id IN (SELECT value FROM json_each")) || sql.startsWith("SELECT * FROM market_coverage"),
+      ).length;
     },
-    prepare(sql) {
-      asked.push(sql);
-      const statement = {
-        bind: () => statement,
-        all: async () => ({ results: rowsFor(sql) }),
-        first: async () => rowsFor(sql)[0] ?? null,
-        run: async () => ({ success: true }),
-      };
-      return statement;
-    },
+    prepare,
+    // The secondary reads of a build travel as one batch, which is one subrequest - see batched().
+    batch: async (statements) => Promise.all(statements.map((statement) => statement.all())),
   };
 }
 
@@ -228,8 +239,11 @@ const SNAPSHOT_PATH = `${SNAPSHOT_PREFIX}anyrevisiontag`;
 // is asked again only once it is five minutes old (REVISION_SHARED_MS in the route).
 const REVISION_RECORD = `https://radar.cheap${SNAPSHOT_PREFIX}current-revision`;
 
+/** The shard an unplaced request for the fixture reads: the deals of its one country. */
+const COUNTRY_SHARD = "country:CA";
+
 /**
- * Lets one isolate publish, and returns the key it published under.
+ * Lets one isolate publish, and returns the key the country shard was published under.
  *
  * The key ends in a hash of the data revision, so a test that wants to plant an entry the route
  * will actually read has to learn the key rather than assemble it. Recomputing the hash here would
@@ -239,24 +253,28 @@ async function seedKey(cache) {
   const first = await isolate();
   assert.equal((await first.call()).status, 200);
   await settleBackgroundWork();
-  return onlyKey(cache);
+  return revisionKeys(cache)[COUNTRY_SHARD];
 }
 
 /**
- * The revision-named key the cache is holding.
+ * The revision-named keys the cache is holding, by shard.
  *
- * A build publishes two entries: one named for the data revision, which a healthy read asks for,
- * and one under a fixed name that a cold isolate can construct without asking D1 — the copy that
- * keeps the site up when D1 is refusing reads.
+ * A build publishes two entries per shard: one named for the data revision, which a healthy read
+ * asks for, and one under a fixed name that a cold isolate can construct without asking D1 — the
+ * copy that keeps the site up when D1 is refusing reads. An unplaced request builds two shards: the
+ * meta shard every request reads, and the country's deals.
  */
-function onlyKey(cache) {
-  const keys = [...cache.store.keys()];
-  const fallback = `https://radar.cheap${SNAPSHOT_PREFIX}latest`;
-  const byRevision = keys.filter((key) => key !== fallback && key !== REVISION_RECORD);
-  assert.ok(keys.includes(fallback), `no fallback copy was published; got ${keys.join(", ")}`);
-  assert.equal(byRevision.length, 1, `expected one revision-named snapshot, got ${byRevision.join(", ")}`);
-  assert.ok(byRevision[0].startsWith(`https://radar.cheap${SNAPSHOT_PREFIX}r`), byRevision[0]);
-  return byRevision[0];
+function revisionKeys(cache) {
+  const keys = [...cache.store.keys()].filter((key) => key.startsWith(`https://radar.cheap${SNAPSHOT_PREFIX}`) && key !== REVISION_RECORD);
+  const byShard = {};
+  for (const key of keys.filter((key) => key.includes("/latest/"))) {
+    const shard = key.slice(key.indexOf("/latest/") + "/latest/".length);
+    const named = keys.filter((other) => other.startsWith(`https://radar.cheap${SNAPSHOT_PREFIX}r`) && other.endsWith(`/${shard}`));
+    assert.equal(named.length, 1, `expected one revision-named copy of ${shard}, got ${named.join(", ")}`);
+    byShard[shard] = named[0];
+  }
+  assert.deepEqual(Object.keys(byShard).sort(), [COUNTRY_SHARD, "meta"], `expected the meta and country shards, got ${keys.join(", ")}`);
+  return byShard;
 }
 
 async function withCache(cache, run) {
@@ -279,7 +297,7 @@ test("the first isolate builds from D1 and leaves the snapshot for the colo", as
     assert.equal(response.status, 200);
     assert.ok(first.db.snapshotQueries > 0, "a cold isolate with an empty cache must build from D1");
     await settleBackgroundWork();
-    onlyKey(cache);
+    revisionKeys(cache);
   });
 });
 
@@ -305,7 +323,9 @@ test("a second isolate serves from the colo's copy without touching D1", async (
 // location lists derived from chain_locations left out and rebuilt on the way back. Whatever that
 // does, a reader served from the copy must get exactly what a reader served from a fresh build
 // gets - a chain with a branch that carries the offer and one that does not, and a national deal
-// with the fields only national deals have.
+// with the fields only national deals have. Four requests, four kinds of shard: the country's
+// deals, the nationwide list, the Saved tab's deals by id (read from D1 as asked, so it is left out
+// of the count), and the map cells around a point.
 test("a deal served from the colo's copy is the deal a fresh build serves", async () => {
   const chain = {
     ...DEAL, id: "deal-2", slug: "chain-wings", restaurant_id: "restaurant-2", canonical_restaurant_id: "restaurant-2",
@@ -398,7 +418,7 @@ test("an entry from another version is ignored", async () => {
     // else it would simply be a miss, and the test would pass without exercising the validation.
     cache.store.set(
       await seedKey(cache),
-      new Response(JSON.stringify({ v: 999, expiresAt: Date.now() + 60_000, bases: [DEAL], coverageRows: [], translations: [] })),
+      new Response(JSON.stringify({ v: 999, key: COUNTRY_SHARD, expiresAt: Date.now() + 60_000, revision: "", sites: [], bases: [DEAL], translations: [] })),
     );
     const fresh = await isolate();
     assert.equal((await fresh.call()).status, 200);
@@ -417,19 +437,39 @@ test("a truncated entry is ignored rather than thrown", async () => {
   });
 });
 
-// An empty catalog is cheap to rebuild and is more likely a failed write than a real answer.
-test("an empty snapshot is not adopted", async () => {
+// An empty shard is a real answer now that the catalogue is in shards: a map cell with no deal in
+// it, a country with none, and the fixture's one country once its deals are gone. The whole
+// catalogue used to be one snapshot, and an empty one was refused as more likely a failed write
+// than the truth; refusing an empty cell would rebuild it on every request from the empty quarter
+// of the map. A failed write is caught instead by the shape check (the two tests above).
+test("an empty shard is adopted", async () => {
   const cache = fakeCache();
   await withCache(cache, async () => {
-    // At the current version and in the current shape, so it is the emptiness that is refused and
-    // not the version or a missing field.
+    // At the current version and in the current shape, named for the shard it is planted as.
     cache.store.set(
       await seedKey(cache),
-      new Response(JSON.stringify({ v: SNAPSHOT_VERSION, expiresAt: Date.now() + 60_000, sites: [], bases: [], brands: [], coverageRows: [], translations: [], aliases: [], centers: [] })),
+      new Response(JSON.stringify({ v: SNAPSHOT_VERSION, key: COUNTRY_SHARD, expiresAt: Date.now() + 60_000, revision: "", sites: [], bases: [], translations: [] })),
+    );
+    const fresh = await isolate();
+    const response = await fresh.call();
+    assert.equal(response.status, 200);
+    assert.equal(fresh.db.snapshotQueries, 0, "an empty shard is not rebuilt");
+    assert.deepEqual((await response.json()).results, [], "and it is the answer");
+  });
+});
+
+// A copy planted under one shard's key that says it is another is a miss: a copy under the wrong
+// name would answer a Vancouver reader with Ottawa's deals.
+test("a copy that names another shard is ignored", async () => {
+  const cache = fakeCache();
+  await withCache(cache, async () => {
+    cache.store.set(
+      await seedKey(cache),
+      new Response(JSON.stringify({ v: SNAPSHOT_VERSION, key: "country:US", expiresAt: Date.now() + 60_000, revision: "", sites: [], bases: [], translations: [] })),
     );
     const fresh = await isolate();
     assert.equal((await fresh.call()).status, 200);
-    assert.ok(fresh.db.snapshotQueries > 0, "an empty cached snapshot must be rebuilt");
+    assert.ok(fresh.db.snapshotQueries > 0, "a copy of another shard must be rebuilt, not adopted");
   });
 });
 
@@ -460,7 +500,7 @@ test("the snapshot key is not reachable as a request", async () => {
     const first = await isolate();
     assert.equal((await first.call()).status, 200);
     await settleBackgroundWork();
-    onlyKey(cache);
+    revisionKeys(cache);
 
     const response = await first.call(SNAPSHOT_PATH);
     assert.equal(response.status, 404, "the cache key must not answer as an endpoint");
@@ -528,7 +568,7 @@ test("a data change is served without waiting for any TTL", async () => {
     const before = await isolate();
     assert.equal((await before.call()).status, 200);
     await settleBackgroundWork();
-    const firstKey = onlyKey(cache);
+    const firstKey = revisionKeys(cache)[COUNTRY_SHARD];
 
     // A staff edit: every write path touches updated_at, so the revision moves. The colo notices
     // once its shared record of the revision is old enough to ask D1 again - aged out here rather
@@ -545,7 +585,7 @@ test("a data change is served without waiting for any TTL", async () => {
     // revision produces that key again — and it falls out on its own when its max-age expires.
     // Deleting it would only work in this one colo anyway, which is the limitation that made
     // purging unusable as an invalidation strategy in the first place.
-    const keys = [...cache.store.keys()].filter((key) => !key.endsWith("/latest") && key !== REVISION_RECORD);
+    const keys = [...cache.store.keys()].filter((key) => key.endsWith(`/${COUNTRY_SHARD}`) && !key.includes("/latest/"));
     assert.ok(keys.includes(firstKey), "the superseded copy may remain; it is simply unreachable");
     assert.equal(keys.length, 2, `expected the old and new keys, got ${keys.join(", ")}`);
     assert.notEqual(keys[1], firstKey, "a changed revision must publish under a different key");
