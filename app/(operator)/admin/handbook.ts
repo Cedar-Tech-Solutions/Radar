@@ -164,9 +164,9 @@ export const HANDBOOK: HandbookSection[] = [
         kind: "reference",
         permission: null,
         area: "admin",
-        summary: "Four high-risk actions only an owner can carry out. Anyone else who holds the permission can ask, and the request waits.",
+        summary: "Five high-risk actions only an owner can carry out. Anyone else who holds the permission can ask, and the request waits.",
         body: [
-          "Pausing or archiving a whole market, deleting a sponsorship contract, paying an affiliate, and flipping an operator switch can each do damage that is hard to undo. Holding the permission for one of them lets you ask; only an owner can make it happen. Admin access is not owner access, so an admin's request waits like anyone else's.",
+          "Pausing or archiving a whole market, deleting a sponsorship contract, paying an affiliate, correcting the referral code on an account, and flipping an operator switch can each do damage that is hard to undo. Holding the permission for one of them lets you ask; only an owner can make it happen. Admin access is not owner access, so an admin's request waits like anyone else's.",
           "Every one of these opens a confirmation step first. Confirm it, and if you are not an owner the screen says the request was sent to an owner for approval. Nothing has changed yet: the market is still live, the money has not moved, the switch is where it was. The request is stored exactly as you asked it, with your reason, and an entry in the audit log says you asked.",
           "An owner reads it in Admin → Approvals and approves or declines it. Approving runs your request exactly as it was asked, under the owner's name, and the audit entry points back to your request. Declining needs a note, which you can read beside the request. If an approved request fails when it runs — the market had no deals left, the affiliate's balance had already been paid — it is marked failed with the reason.",
         ],

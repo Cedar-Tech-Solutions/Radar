@@ -85,7 +85,8 @@ async function loadAuth(runtimeEnv) {
         authSource
           .replace(/^import .*(cloudflare:workers|next\/headers|next\/navigation|@clerk\/backend).*$/gm, "")
           .replace(/^import \{ ADMIN_ENTRY_PERMISSION.*$/gm, "")
-          .replace(/^import \{ hasProAccess, isProPlan \}.*$/gm, "const isProPlan = () => false; const hasProAccess = () => false;"),
+          .replace(/^import \{ hasProAccess, isProPlan \}.*$/gm, "const isProPlan = () => false; const hasProAccess = () => false;")
+          .replace(/^import \{ resolveReferralCode \}.*$/gm, "const resolveReferralCode = async () => ({ ok: false });"),
         { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } },
       ).outputText,
     ).toString("base64")}#${Math.random()}`

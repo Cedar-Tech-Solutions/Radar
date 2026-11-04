@@ -6,6 +6,7 @@ import ClerkClientProvider from "../../../ClerkClientProvider";
 import { safeAuthRedirect } from "../../../auth-redirect";
 import RadarMark from "../../../RadarMark";
 import ChromeLink from "../../../ChromeLink";
+import ReferralCodeField from "./ReferralCodeField";
 // ChromeLinks, not next-intl's <Link> (app/ChromeLink.tsx): for a reader without a session cookie a
 // plain page load, which the Worker answers without a render - whoever reads this page is signed
 // out, and the home page is baked - where a client-side link's flight is a render every time. For a
@@ -37,6 +38,7 @@ export default function SignUpPage() {
             <h1 id="auth-heading">{t("signUpHeading")}</h1>
             <p>{t("signUpSubtitle")}</p>
           </header>
+          <ReferralCodeField />
           <SignUp
             path={`/${locale}/sign-up`}
             routing="path"

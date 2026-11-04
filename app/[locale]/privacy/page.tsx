@@ -236,7 +236,15 @@ export default async function Privacy({ params }: { params: Promise<{ locale: st
           once, when the account is created, and an existing account is never re-attributed. The
           creator sees how many people signed up and subscribed through their links and what they
           earned, never your name or email address. If your browser sends Global Privacy Control, no
-          referral is recorded.
+          referral is recorded from a link.
+        </p>
+        <p>
+          <strong>Referral codes.</strong> You can also type a creator&rsquo;s referral code yourself,
+          on the sign-up page or in your dashboard within 7 days of creating your account. Because you
+          chose to enter it, it is recorded even if your browser sends Global Privacy Control, and it
+          is used exactly like a link referral. An account has one referral, and once it is set you
+          cannot change or remove it. Our staff can correct one made by mistake if you ask; each
+          correction needs an owner&rsquo;s approval and is kept in our audit log.
         </p>
 
         <h2 id="use">3. How we use information</h2>
@@ -319,7 +327,13 @@ export default async function Privacy({ params }: { params: Promise<{ locale: st
             that creator&rsquo;s picks, and the deals you open are counted in the creator&rsquo;s
             totals without being linked to you. A later creator link replaces them. If your browser
             sends Global Privacy Control, they are not set, any already set are removed, and an
-            account created from that browser is not attributed to a creator.
+            account created from that browser is not attributed to a creator through a link.
+          </li>
+          <li>
+            <strong>Referral code cookie</strong>, <code>radar_referral_code</code>, set only when you
+            enter a referral code on the sign-up page. It holds the creator&rsquo;s handle for up to 7
+            days so it can be written onto your account when the account is created, and is removed if
+            you clear the code. It cannot be read by scripts on the page.
           </li>
           <li>
             <strong>Local storage on your device</strong> for your theme and accent color, so the

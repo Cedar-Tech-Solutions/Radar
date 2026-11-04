@@ -199,9 +199,9 @@ test("the Apple paths and the account endpoint use the same decision", () => {
   assert.match(userRoute, /const billing = pro \? await billingFor\(user\.userId\) : null;/);
   // The website's billing controls ask the ownership rule itself whether there is a web
   // subscription to act on, and the subscription's id never leaves the server.
-  assert.match(userRoute, /const \{ stripe_subscription_id: subscriptionId, \.\.\.shown \} = profile;/);
+  assert.match(userRoute, /const \{ stripe_subscription_id: subscriptionId, referred_by: referredBy, \.\.\.shown \} = profile;/);
   assert.match(userRoute, /const web_subscription = stripeOwnsStatus\(\{ subscriptionId, status: profile\.plan_status,/);
-  assert.match(userRoute, /profile:\{ \.\.\.shown, billing, web_subscription \}/);
+  assert.match(userRoute, /profile:\{ \.\.\.shown, billing, web_subscription, referral \}/);
 });
 
 test("an admin grant or revoke resolves the plan instead of writing it", () => {

@@ -19,6 +19,7 @@ const { authorizedPartyOf, verificationPolicy, AUTHORIZED_PARTIES } = await impo
         // isPro() is not what this file tests, and a data: URL module cannot resolve a
         // relative import. Stubbed rather than stripped, so the function it feeds still parses.
         .replace(/^import \{ hasProAccess, isProPlan \}.*$/gm, "const isProPlan = () => false; const hasProAccess = () => false;")
+        .replace(/^import \{ resolveReferralCode \}.*$/gm, "const resolveReferralCode = async () => ({ ok: false });")
         .replace(/^const env = .*$/gm, ""),
       { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } },
     ).outputText,

@@ -1,6 +1,6 @@
 "use client";
 import { useState } from "react";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { SignOutButton, UserButton } from "@clerk/react";
 import { ChevronRight, Lock } from "lucide-react";
 import { onRadioGroupKey, radioTabIndex } from "../../../radio-group-keys";
@@ -17,7 +17,18 @@ import type { SectionProps } from "../dashboard-shared";
 // billing, Privacy & data); this one says which plan they are on and links there.
 export default function AccountSection({ data, pro, busy, mutate, reload, upgrade }: SectionProps) {
   const t = useTranslations("dashboard"), tTheme = useTranslations("theme");
+  const locale = useLocale();
   const p = data.profile;
+  const referral = p.referral;
+  async function addReferral(event:React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const code = String(new FormData(event.currentTarget).get("code") || "").trim();
+    if (!code) return;
+    // Permanent once added, so the reader confirms the exact code first. The server holds the
+    // rules (one code, 7-day window, never changed); this is only the last chance to fix a typo.
+    if (!window.confirm(t("account.referralConfirm",{code}))) return;
+    if (await mutate({action:"referral_code",code},t("account.referralAdded"))) await reload();
+  }
   const [theme,setTheme] = useState<Theme>(p.theme === "light" || p.theme === "dark" || p.theme === "system" ? p.theme : "dark");
   const [accent,setAccent] = useState(isAccentKey(p.accent_color) ? p.accent_color : "coral");
   async function persistAppearance(nextTheme:Theme,nextAccent:string) {
@@ -42,5 +53,10 @@ export default function AccountSection({ data, pro, busy, mutate, reload, upgrad
     <section className="portal-card"><div className="portal-card-head"><div><h2>{t("account.signInHeading")}</h2></div></div><div className="account-settings-grid"><div><b>{p.name || p.email.split("@")[0]}</b><span>{p.email}</span><small>{t("account.manageProviders")}</small></div><div className="dashboard-account-actions"><UserButton/><SignOutButton redirectUrl="/"><button type="button">{t("account.signOut")}</button></SignOutButton></div></div>
       <div className="appearance-row dash-plan-summary"><span>{t("account.plan")}: <b>{pro ? t("account.radarPro") : t("account.freePlan")}</b></span><Link href="/dashboard/billing">{t("account.planLink")} <ChevronRight aria-hidden="true"/></Link></div>
     </section>
+    {referral && (referral.code || referral.can_add) && <section className="portal-card"><div className="portal-card-head"><div><h2>{t("account.referralHeading")}</h2></div>{referral.code && <Lock aria-hidden="true"/>}</div>
+      {referral.code
+        ? <div className="appearance-row"><span>{t("account.referralCurrent")}: <b><code>{referral.code}</code></b></span><small className="dash-field-note">{t("account.referralLocked")}</small></div>
+        : <form className="preferences" onSubmit={addReferral}><p className="wide">{t("account.referralIntro")}</p><label>{t("account.referralLabel")}<input name="code" autoComplete="off" autoCapitalize="none" spellCheck={false} maxLength={64} placeholder={t("account.referralPlaceholder")} required/>{referral.window_ends_at && <small className="dash-field-note">{t("account.referralDeadline",{date:new Date(referral.window_ends_at).toLocaleDateString(locale,{dateStyle:"long"})})}</small>}</label><button className="primary" disabled={busy === "referral_code"}>{t("account.referralAdd")}</button></form>}
+    </section>}
   </>;
 }

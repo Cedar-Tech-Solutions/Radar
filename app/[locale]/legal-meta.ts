@@ -12,7 +12,7 @@
 // Stored as ISO dates and written out per language by legalDate, because the French documents
 // carry the same date as the English ones and "30 SEPTEMBRE 2026" should not be a second
 // hand-edited string that can drift from "SEPTEMBER 30, 2026".
-export const PRIVACY_LAST_UPDATED = "2026-10-07";
+export const PRIVACY_LAST_UPDATED = "2026-11-04";
 export const TERMS_LAST_UPDATED = "2026-10-17";
 
 /** "SEPTEMBER 30, 2026" in English, "30 SEPTEMBRE 2026" in French, for the kicker above a document. */

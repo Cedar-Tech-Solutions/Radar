@@ -260,6 +260,16 @@ someone off.
   to an active creator — so an existing account cannot be re-attributed by clicking a link, and
   the cookie cannot name someone who is not a creator. There is no per-deal click metric anywhere
   in Radar, so the workspace reports where visits landed rather than inventing one.
+- **A referral code** is the same handle typed in by the reader instead of clicked
+  (`app/referral-code.ts`): on the sign-up page (checked by `POST /api/referral-code`, parked in the
+  httpOnly `radar_referral_code` cookie, and re-checked by `app/auth.ts` when the row is created),
+  or from the dashboard's Account section within 7 days of sign-up (`referral_code` on
+  `/api/user`). It writes the same `users.referred_by`, so commissions accrue exactly as for a
+  link. One per account; the reader can never change or remove it once set, enforced in the
+  `UPDATE ... WHERE referred_by IS NULL` itself. Every one is audit-logged as `referral_code_set`.
+  Staff fix a wrong one with `referral_correction` (`manage_finance`, owner approval, a reason;
+  only future commissions move). A typed code is recorded even with GPC on, since the reader
+  entered it; link cookies still are not.
 - **A campaign label** (`?c=<handle>&camp=<label>`) is the optional fourth piece, and it travels
   the same path one level down: recorded on the visit, parked in its own cookie, written to
   `users.referred_campaign` beside the handle at account creation, and copied onto
@@ -380,7 +390,7 @@ action is denied to everyone, owners included, until it is added.
 | `publish_deals` | `lifecycle`, `bulk_lifecycle` (one named market, owner approval), `archive_drafts` (one draft, with a reason), `publish_drafts` (one draft; also needs `verify_deals`, since it verifies the draft as it publishes it) |
 | `verify_deals` | `verify`, `resolve_staff_reminder` |
 | `manage_sponsorships` | `sponsorship`, `create_sponsorship`, `update_sponsorship`, `delete_sponsorship` (owner approval) |
-| `manage_finance` | `creator_application`, `creator_commission`, `affiliate_payout` (owner approval), `plan_grant` |
+| `manage_finance` | `creator_application`, `creator_commission`, `affiliate_payout` (owner approval), `plan_grant`, `referral_correction` (owner approval, needs a reason) |
 | `manage_restaurant_photos` | `set_restaurant_photo` (and `POST /api/admin/photo-upload`) |
 | `moderate_suggestions` | `suggestion` (rejecting needs a reason), `convert_suggestion` |
 | `moderate_feedback` | `feedback`, `report` (changing a completed one also needs `reopen_reports`) |

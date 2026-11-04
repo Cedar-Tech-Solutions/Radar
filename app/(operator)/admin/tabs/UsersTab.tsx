@@ -4,6 +4,7 @@ import {
   ChevronDown,
   Eye,
   EyeOff,
+  Link2,
   Megaphone,
   Pencil,
   ShieldCheck,
@@ -11,6 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { DialogFocus } from "../../DialogFocus";
+import { useOwnerApprovalAction } from "../FinancePanels";
 import { GatedButton } from "../GatedButton";
 import { ListCount, ListEmpty, ListToolbar, listCountLabel, Pager, pageRows, selectRows } from "../../ListScope";
 import {
@@ -79,7 +81,11 @@ export default function UsersTab() {
     [creatorRate, setCreatorRate] = useState(""),
     [desiredRole, setDesiredRole] = useState<Role>("user"),
     [desiredCustomPermissions, setDesiredCustomPermissions] = useState<Set<string>>(new Set()),
-    [roleReason, setRoleReason] = useState("");
+    [roleReason, setRoleReason] = useState(""),
+    [referralDialog, setReferralDialog] = useState<AdminUser | null>(null),
+    [referralHandle, setReferralHandle] = useState(""),
+    [referralReason, setReferralReason] = useState("");
+  const ownerAction = useOwnerApprovalAction();
   const allUsers = useMemo(() => data?.users || [], [data?.users]);
   const options = useMemo(() => {
     const sorted = (values: (string | null | undefined)[]) => Array.from(new Set(values.filter((v): v is string => Boolean(v)))).sort();
@@ -270,6 +276,7 @@ export default function UsersTab() {
                   <div><dt>Time zone</dt><dd>{u.timezone || "Not set"}</dd></div>
                   <div><dt>Deal alerts</dt><dd>{u.alerts_enabled ? `On${u.alert_days ? ` · ${u.alert_days}` : ""}${u.alert_time ? ` at ${u.alert_time}` : ""}` : "Off"}</dd></div>
                   <div><dt>Joined</dt><dd>{day(u.created_at)}</dd></div>
+                  <div><dt>Referral code</dt><dd>{u.referred_by ? <code>{u.referred_by}</code> : "None"}</dd></div>
                   {canSetUserVisibility && (
                     <div><dt>Visibility</dt><dd>{u.hidden ? "Hidden from every role except owner and admin" : "Visible to everyone who manages users"}</dd></div>
                   )}
@@ -330,6 +337,16 @@ export default function UsersTab() {
                       onClick={() => { const p = creatorFor(u.id); setCreatorDialog(u); setCreatorHandle(p?.handle || ""); setCreatorDisplayName(p?.display_name || ""); setCreatorPaused(p?.status === "paused"); setCreatorRate(p ? String((p.commission_rate_bps ?? 2000) / 100) : "20"); }}
                     >
                       <Megaphone /> {creator ? "Creator link" : "Set up creator"}<span className="sr-only"> for {displayName(u)}</span>
+                    </button>
+                  )}
+                  {canManageFinance && (
+                    <button
+                      type="button"
+                      disabled={busy === `referral_correction-${u.id}`}
+                      title="Correct the creator this account is credited to. Needs an owner's approval."
+                      onClick={() => { setReferralDialog(u); setReferralHandle(u.referred_by || ""); setReferralReason(""); }}
+                    >
+                      <Link2 /> Correct referral<span className="sr-only"> for {displayName(u)}</span>
                     </button>
                   )}
                   {canSetUserVisibility && (
@@ -414,6 +431,56 @@ export default function UsersTab() {
                   }}
                 >
                   Apply
+                </button>
+              </div>
+            </section>
+          </div>
+        );
+      })()}
+      {referralDialog && (() => {
+        const handle = referralHandle.trim().toLowerCase().replace(/^@/, "");
+        const valid = !handle || /^[a-z0-9][a-z0-9-]{1,31}$/.test(handle);
+        const unchanged = handle === (referralDialog.referred_by || "");
+        return (
+          // Backdrop click-to-dismiss is a mouse-only convenience; the close button below remains
+          // the fully keyboard-accessible way to dismiss this dialog.
+          // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+          <div className="overlay" onMouseDown={() => setReferralDialog(null)}>
+            {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- only stops backdrop clicks from closing when they originate inside the dialog */}
+            <section className="modal confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="referral-title" onMouseDown={(event) => event.stopPropagation()}>
+              <DialogFocus onClose={() => setReferralDialog(null)} />
+              <button className="close" aria-label="Close" onClick={() => setReferralDialog(null)}><X /></button>
+              <span className="kicker">REFERRAL CORRECTION</span>
+              <h2 id="referral-title">{referralDialog.name || referralDialog.email}</h2>
+              <p>
+                Readers can never change their own referral code, so this is the only way it moves. It changes which
+                creator earns on this account’s future payments; commissions already earned stay where they are. An
+                owner has to approve it, and the old and new code are kept in the audit log with your reason.
+              </p>
+              <label className="typed-confirmation">
+                Creator handle
+                <input value={referralHandle} onChange={(event) => setReferralHandle(event.target.value)} placeholder="maya" autoComplete="off" spellCheck={false} />
+                <small>{handle ? `Credit ${handle}` : "Leave empty to remove the referral."} Currently {referralDialog.referred_by || "none"}.</small>
+                {!valid && <small className="field-error">A handle is 2–32 characters: lowercase letters, numbers and hyphens.</small>}
+              </label>
+              <label className="typed-confirmation">
+                Reason
+                <textarea value={referralReason} onChange={(event) => setReferralReason(event.target.value)} maxLength={500} />
+              </label>
+              <div className="editor-actions">
+                <button onClick={() => setReferralDialog(null)}>Cancel</button>
+                <button
+                  className="primary"
+                  disabled={!valid || unchanged || !referralReason.trim() || busy === `referral_correction-${referralDialog.id}`}
+                  onClick={async () => {
+                    const outcome = await ownerAction(
+                      { action: "referral_correction", id: referralDialog.id, handle, reason: referralReason },
+                      `referral_correction-${referralDialog.id}`,
+                    );
+                    if (outcome) setReferralDialog(null);
+                  }}
+                >
+                  {isOwner ? "Apply correction" : "Ask an owner"}
                 </button>
               </div>
             </section>

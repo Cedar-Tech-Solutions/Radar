@@ -6,6 +6,7 @@ import { ADMIN_ENTRY_PERMISSION, ALL_PERMISSIONS, isWorkspaceRole, type Permissi
 
 export type { Permission };
 import { hasProAccess, isProPlan } from "./entitlement";
+import { resolveReferralCode } from "./referral-code";
 
 export type AppUser = {
   userId: string;
@@ -81,17 +82,28 @@ async function permissionsForUser(userId: string, role: AppUser["role"]): Promis
 // A request carrying Global Privacy Control (Sec-GPC: 1) is never attributed, even with the cookie
 // present: CreatorLink.tsx stops setting it for such a browser, and this covers a cookie parked
 // before the reader turned the signal on.
-async function referringCreator(cookieStore: Awaited<ReturnType<typeof cookies>>) {
-  if ((await headers()).get("sec-gpc") === "1") return { handle: null, campaign: null };
+//
+// A code the reader typed on the sign-up page (app/api/referral-code) comes first, and is honoured
+// even with GPC on: it is the reader naming a creator themselves, not a cookie a link parked. It is
+// checked against the creators table again here, since a cookie is only ever a hint.
+async function referringCreator(cookieStore: Awaited<ReturnType<typeof cookies>>): Promise<{ handle: string | null; campaign: string | null; source: "signup_code" | "link" | null }> {
+  // The name is REFERRAL_CODE_COOKIE in app/referral-code.ts, spelled out so tests/route-params.test.mjs
+  // can see which cookies this file reads.
+  const typed = cookieStore.get("radar_referral_code")?.value;
+  if (typed) {
+    const lookup = await resolveReferralCode(typed, null);
+    if (lookup.ok) return { handle: lookup.handle, campaign: null, source: "signup_code" };
+  }
+  if ((await headers()).get("sec-gpc") === "1") return { handle: null, campaign: null, source: null };
   const handle = (cookieStore.get("radar_creator")?.value || "").trim().toLowerCase();
-  if (!/^[a-z0-9][a-z0-9-]{1,31}$/.test(handle)) return { handle: null, campaign: null };
+  if (!/^[a-z0-9][a-z0-9-]{1,31}$/.test(handle)) return { handle: null, campaign: null, source: null };
   const row = await env.DB.prepare("SELECT handle FROM creator_profiles WHERE handle=? AND status='active'")
     .bind(handle).first<{ handle: string }>();
-  if (!row?.handle) return { handle: null, campaign: null };
+  if (!row?.handle) return { handle: null, campaign: null, source: null };
   // Only meaningful alongside a handle that resolved, so it is read inside this branch: a
   // campaign label with no creator behind it is not attribution, it is a stray cookie.
   const label = (cookieStore.get("radar_creator_campaign")?.value || "").trim().toLowerCase();
-  return { handle: row.handle, campaign: /^[a-z0-9][a-z0-9-]{1,47}$/.test(label) ? label : null };
+  return { handle: row.handle, campaign: /^[a-z0-9][a-z0-9-]{1,47}$/.test(label) ? label : null, source: "link" };
 }
 
 async function mappedProfile(subject: string) {
@@ -240,6 +252,11 @@ export async function getAppUser(): Promise<AppUser | null> {
       env.DB.prepare("INSERT INTO users(id,email,name,role,referred_by,referred_campaign) VALUES(?,?,?,'user',?,?)").bind(appUserId,email,name,referral.handle,referral.campaign),
       env.DB.prepare("INSERT INTO auth_identities(provider,subject,user_id,verified_email) VALUES('clerk',?,?,?)").bind(session.sub,appUserId,email),
       env.DB.prepare("INSERT INTO audit_log(actor_id,actor_role,action,target_type,target_id,details) VALUES(?,'user','identity_attached','user',?,?)").bind(appUserId,appUserId,JSON.stringify({provider:"clerk",newAccount:true})),
+      // Who gets paid on this account's subscription is worth a trail of its own, whichever way
+      // it arrived: a link, or a code typed on the sign-up page.
+      ...(referral.handle
+        ? [env.DB.prepare("INSERT INTO audit_log(actor_id,actor_role,action,target_type,target_id,details) VALUES(?,'user','referral_code_set','user',?,?)").bind(appUserId,appUserId,JSON.stringify({handle:referral.handle,campaign:referral.campaign,source:referral.source}))]
+        : []),
     ]);
     profile = { id: appUserId, role: "user", status: "active", plan: "free", plan_status: "inactive", past_due_since: null, paused_until: null };
   } else {

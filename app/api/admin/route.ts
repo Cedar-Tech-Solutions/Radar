@@ -12,6 +12,7 @@ import { slugify } from "../../slug";
 import { narrowPriceTier } from "../../price-tiers";
 import { classifyServiceStyle, dealCopyForServiceStyle, type ServiceStyle } from "../../service-style";
 import { requestPayout } from "../../affiliate-payouts";
+import { normalizeReferralCode, resolveReferralCode } from "../../referral-code";
 import { resolveRejectionReason } from "../../suggestion-review";
 import { REVIEW_QUEUE_SQL, buildReviewQueue, type ReviewQueueRow } from "../../review-queue";
 import { CLEAR_STAFF_REMINDERS_SQL, OPEN_STAFF_REMINDERS_SQL, type StaffReminder } from "../../staff-reminders";
@@ -943,7 +944,7 @@ export async function GET(request: Request) {
     // permission: a custom role can be granted manage_users, and the whole point of hiding an
     // account is that holding that permission is not by itself enough to see it.
     gated(canManageUsers || canManageEmail, () => env.DB.prepare(
-      `SELECT id,email,name,role,status,hidden,home_postal,alerts_enabled,alert_days,alert_time,language,timezone,country,distance_unit,plan,plan_status,created_at FROM users${isAdminPlus ? "" : " WHERE hidden=0"} ORDER BY created_at DESC LIMIT 500`,
+      `SELECT id,email,name,role,status,hidden,home_postal,alerts_enabled,alert_days,alert_time,language,timezone,country,distance_unit,plan,plan_status,created_at,referred_by FROM users${isAdminPlus ? "" : " WHERE hidden=0"} ORDER BY created_at DESC LIMIT 500`,
     ).all()),
     // Open and reviewing first, so a pile of resolved items can never push live work past the
     // limit. The deal title is for feedback sent from a deal's page; the resolver's name is who to
@@ -1369,6 +1370,8 @@ async function precheckOwnerApproval(b: AdminActionBody): Promise<Response | nul
     }
     case "setting":
       return isSettingKey(b.key) ? null : apiError(422,"INVALID_SETTING","Unknown setting.");
+    case "referral_correction":
+      return cleanText(b.reason,500) ? null : apiError(422,"REASON_REQUIRED","Record a reason for this correction.",{reason:"Required"});
     case "affiliate_payout": {
       const handle = cleanText(b.handle,32).toLowerCase();
       const currency = cleanText(b.currency,3).toLowerCase();
@@ -1396,6 +1399,11 @@ async function describeOwnerApproval(b: AdminActionBody): Promise<string> {
       const owed = await env.DB.prepare("SELECT COALESCE(SUM(commission_amount),0) amount FROM creator_commissions WHERE handle=? AND currency=? AND status='approved' AND payout_id IS NULL")
         .bind(handle,currency).first<{ amount: number }>();
       return `Pay ${handle} what they are owed in ${currency.toUpperCase()} (${((owed?.amount || 0) / 100).toFixed(2)} at the time of asking) through Stripe`;
+    }
+    case "referral_correction": {
+      const target = await env.DB.prepare("SELECT email,referred_by FROM users WHERE id=?").bind(b.id).first<{ email: string; referred_by: string | null }>();
+      const handle = normalizeReferralCode(b.handle);
+      return `Change the referral code on ${target?.email || "an account"} from ${target?.referred_by || "none"} to ${handle || "none"}`;
     }
     case "setting": {
       const definition = isSettingKey(b.key) ? SETTINGS[b.key] : null;
@@ -2042,6 +2050,37 @@ async function performAction(current: AppUser, b: AdminActionBody, origin: strin
     auditDetails.targetEmail = targetUser.email;
     auditDetails.hidden = Boolean(hidden);
     await env.DB.prepare("UPDATE users SET hidden=? WHERE id=?").bind(hidden, b.id).run();
+  } else if (b.action === "referral_correction") {
+    // Correcting the referral on an account: the one way a referral code changes after it is set.
+    //
+    // Readers can never change or remove their own (app/referral-code.ts), and that permanence is
+    // what a creator relies on. Staff can, because a wrong code does happen: a typo that landed on
+    // a real handle, a creator's own family account, a code applied by mistake. It moves who is paid
+    // on that account's future invoices, so it is a finance decision that also needs an owner
+    // (OWNER_APPROVAL_ACTIONS), always with a reason, and the old and new code go in the audit log.
+    // Commissions already accrued stay with whoever earned them; refunds and voids have their own
+    // path (creator_commission). An empty handle clears the referral.
+    targetType = "user";
+    targetId = String(b.id || "");
+    const reason = cleanText(b.reason,500);
+    if (!reason) return apiError(422,"REASON_REQUIRED","Record a reason for this correction.",{reason:"Required"});
+    const target = await env.DB.prepare("SELECT id,email,referred_by FROM users WHERE id=?").bind(targetId).first<{ id: string; email: string; referred_by: string | null }>();
+    if (!target) return apiError(404,"USER_NOT_FOUND","That account could not be found.");
+    const requested = cleanText(b.handle,300);
+    let handle: string | null = null;
+    if (requested) {
+      const lookup = await resolveReferralCode(requested,target.id);
+      if (!lookup.ok) return lookup.reason === "self"
+        ? apiError(422,"REFERRAL_SELF","A creator cannot be credited for their own account.",{handle:"Own account"})
+        : apiError(404,"REFERRAL_CODE_NOT_FOUND","No active creator has that handle.",{handle:"Not found"});
+      handle = lookup.handle;
+    }
+    if (handle === target.referred_by) return apiError(409,"REFERRAL_UNCHANGED","That is already this account's referral code.");
+    auditDetails.email = target.email;
+    auditDetails.previousHandle = target.referred_by;
+    auditDetails.newHandle = handle;
+    // The campaign belonged to the old link, so it goes with it.
+    await env.DB.prepare("UPDATE users SET referred_by=?,referred_campaign=NULL WHERE id=?").bind(handle,target.id).run();
   } else if (b.action === "subscriber") {
     targetType = "subscriber";
     if (b.enabled) {

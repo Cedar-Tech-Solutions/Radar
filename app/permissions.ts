@@ -150,6 +150,9 @@ export const ACTION_PERMISSIONS: Record<string, Permission> = {
   creator_application: "manage_finance",
   // Comping Pro is giving away the product, which is a finance decision.
   plan_grant: "manage_finance",
+  // Changing who is credited (and paid) for an account's subscription. Readers can never change
+  // their own referral code; this is the audited correction path. Also needs an owner's approval.
+  referral_correction: "manage_finance",
   // Operator switches (free trials today). Also needs an owner's approval.
   setting: "manage_users",
   creator_pick: "manage_users",
@@ -182,6 +185,7 @@ export const OWNER_APPROVAL_ACTIONS: readonly string[] = [
   "delete_sponsorship",
   "affiliate_payout",
   "setting",
+  "referral_correction",
 ];
 
 export function needsOwnerApproval(action: string) {

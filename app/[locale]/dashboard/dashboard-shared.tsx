@@ -62,6 +62,8 @@ export interface UserProfile {
   billing?: Billing;
   /** A Stripe subscription that is not over, which is what Stripe's controls act on. */
   web_subscription?: boolean;
+  /** The account's referral code, and whether the reader can still add one (app/referral-code.ts). */
+  referral?: { code: string | null; can_add: boolean; window_ends_at: string | null };
 }
 
 export interface SavedLocation {
@@ -153,6 +155,7 @@ export interface MutatePayload {
   restaurantId?: string;
   theme?: string;
   accentColor?: string;
+  code?: string;
 }
 
 // The server's own `message` is English and is not read: the notice is the caller's translated

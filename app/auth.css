@@ -85,6 +85,49 @@ html[data-theme="dark"] .auth-panel .cl-dividerLine {
 .auth-legal a {
   color: var(--ink);
 }
+/* The optional referral code above Clerk's form ([[...sign-up]]/ReferralCodeField.tsx). */
+.auth-referral {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--field);
+  font-size: 0.85rem;
+}
+.auth-referral label { font-weight: 700; }
+.auth-referral-row { display: flex; gap: 8px; }
+.auth-referral-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--cream);
+  color: var(--ink);
+  font: inherit;
+}
+.auth-referral-row button,
+.auth-referral-applied button {
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+.auth-referral-row button:disabled { opacity: 0.55; cursor: default; }
+.auth-referral small { color: var(--muted); line-height: 1.4; }
+.auth-referral small.auth-referral-error { color: var(--field-bad); }
+.auth-referral-applied {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
 .signupbtn {
   background: var(--coral-strong) !important;
   color: var(--on-coral) !important;

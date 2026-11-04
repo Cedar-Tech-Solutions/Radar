@@ -243,7 +243,11 @@
       "INVALID_OFFER": "Esa opción no está disponible. Vuelve a empezar desde el formulario de cancelación.",
       "OFFER_NOT_OPEN": "Esa propuesta ya no está disponible. Vuelve a empezar desde el formulario de cancelación.",
       "INVALID_STEP": "Algo salió mal. Recarga la página e inténtalo de nuevo.",
-      "AREA_LIMIT_ACTIVE": "El plan gratuito mantiene una sola zona activa. Pausa primero tu otra zona o pásate a Radar Pro."
+      "AREA_LIMIT_ACTIVE": "El plan gratuito mantiene una sola zona activa. Pausa primero tu otra zona o pásate a Radar Pro.",
+      "REFERRAL_CODE_NOT_FOUND": "No se encontró ese código de referido. Revisa cómo está escrito e inténtalo de nuevo.",
+      "REFERRAL_LOCKED": "Esta cuenta ya tiene un código de referido y no se puede cambiar.",
+      "REFERRAL_WINDOW_CLOSED": "Los códigos de referido solo se pueden agregar en los primeros 7 días después de crear la cuenta.",
+      "REFERRAL_SELF": "No puedes usar tu propio código de referido."
     },
     "fields": {
       "required": "Obligatorio",
@@ -266,7 +270,16 @@
     "signUpKicker": "Crear una cuenta",
     "signUpHeading": "Encuentra más buenas ofertas cerca de ti",
     "signUpSubtitle": "Guarda tus lugares favoritos y elige cuándo quieres recibir alertas de ofertas.",
-    "legal": "Al continuar, aceptas los <terms>Términos</terms> de Radar y reconoces la <privacy>Política de privacidad</privacy>."
+    "legal": "Al continuar, aceptas los <terms>Términos</terms> de Radar y reconoces la <privacy>Política de privacidad</privacy>.",
+    "referralLabel": "Código de referido (opcional)",
+    "referralHint": "¿Un creador te dio un código? Agrégalo ahora. No se podrá cambiar después.",
+    "referralPlaceholder": "p. ej. maya",
+    "referralApply": "Aplicar",
+    "referralChecking": "Verificando…",
+    "referralApplied": "El código {code} se agregará a tu nueva cuenta.",
+    "referralRemove": "Quitar",
+    "referralNotFound": "No se encontró ese código de referido. Revisa cómo está escrito e inténtalo de nuevo.",
+    "referralFailed": "No se pudo verificar el código en este momento. También puedes agregarlo desde tu panel en los próximos 7 días."
   },
   "confirmEmail": {
     "pageTitle": "Confirmar consentimiento de correo — Radar",
@@ -740,7 +753,17 @@
       "trialNote": "Gratis durante {days} días y después el precio del plan. Cancela antes de que termine y no se te cobra.",
       "timezoneHint": "Los resúmenes de alertas llegan a la hora que elijas en esta zona horaria.",
       "signInHeading": "Inicio de sesión y seguridad",
-      "planLink": "Plan y facturación"
+      "planLink": "Plan y facturación",
+      "referralHeading": "Código de referido",
+      "referralIntro": "Si un creador te trajo a Radar, agrega su código para darle el crédito. Cada cuenta puede tener un solo código y, una vez agregado, no se puede cambiar ni quitar.",
+      "referralLabel": "Código de referido",
+      "referralPlaceholder": "p. ej. maya",
+      "referralAdd": "Agregar código",
+      "referralDeadline": "Puedes agregar un código hasta el {date}.",
+      "referralConfirm": "¿Agregar {code} como tu código de referido? No se podrá cambiar ni quitar después.",
+      "referralAdded": "Código de referido agregado.",
+      "referralCurrent": "Tu código de referido",
+      "referralLocked": "Los códigos de referido son permanentes una vez agregados. Contacta a soporte si se agregó por error."
     },
     "footer": {
       "controls": "Controles de la cuenta de Radar",

@@ -411,7 +411,7 @@ const REQUEST_READS = {
   // A bearer token or the session cookie: isSignedIn again. The creator referral cookies are read
   // only once a token has verified, for a new account's referral - never for a request the Worker
   // shares. Sec-GPC is read in the same place, to drop that referral for a browser that opted out.
-  "app/auth.ts": ["cookies:__session", "cookies:radar_creator", "cookies:radar_creator_campaign", "headers:authorization", "headers:sec-gpc"],
+  "app/auth.ts": ["cookies:__session", "cookies:radar_creator", "cookies:radar_creator_campaign", "cookies:radar_referral_code", "headers:authorization", "headers:sec-gpc"],
   // Read by requireSameOrigin, clientKey and verifyTurnstile, which only API routes call; the pages
   // import this file for its postal-code validators (checked in the test below).
   "app/api-utils.ts": ["headers:cf-connecting-ip", "headers:host"],

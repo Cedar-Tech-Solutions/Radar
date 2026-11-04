@@ -12,6 +12,7 @@ import { dealPageVisibility, publicDealPredicate } from "../../deal-lifecycle";
 import { billingFor } from "../../apple-entitlement";
 import { stripeOwnsStatus } from "../../plan-resolution";
 import { canonicalTimezone, DEFAULT_TIMEZONE } from "../../timezones";
+import { REFERRAL_WINDOW_DAYS, referralWindowEndsAt, referralWindowOpen, resolveReferralCode } from "../../referral-code";
 
 // The languages Radar writes in, which are the locales the site ships. The account picker used to
 // offer two of the three, and the coercion below turned anything that was not French into English
@@ -76,6 +77,7 @@ interface UserActionBody {
   restaurantId?: unknown;
   theme?: unknown;
   accentColor?: unknown;
+  code?: unknown;
 }
 
 interface SavedLocationRow {
@@ -111,8 +113,8 @@ export async function GET() {
   if (!user) return apiError(401,"AUTH_REQUIRED","Sign in required.");
   const pro = isPro(user);
   const [profile,favs,savedDeals,locations,savedRestaurants,excludedRestaurants,preferences,consent,deliveries,comingSoonMarkets] = await Promise.all([
-    env.DB.prepare("SELECT id,email,name,role,home_postal,status,language,timezone,country,distance_unit,theme,accent_color,plan,plan_status,past_due_since,paused_until,created_at,stripe_subscription_id FROM users WHERE id=?").bind(user.userId)
-      .first<Record<string, unknown> & { plan_status: string | null; past_due_since: string | null; paused_until: string | null; stripe_subscription_id: string | null }>(),
+    env.DB.prepare("SELECT id,email,name,role,home_postal,status,language,timezone,country,distance_unit,theme,accent_color,plan,plan_status,past_due_since,paused_until,created_at,stripe_subscription_id,referred_by FROM users WHERE id=?").bind(user.userId)
+      .first<Record<string, unknown> & { plan_status: string | null; past_due_since: string | null; paused_until: string | null; stripe_subscription_id: string | null; referred_by: string | null; created_at: string }>(),
     // A save of a duplicate that was since folded into another deal (drizzle/0056) is a save of the
     // deal it was folded into: every screen compares these ids with deal ids, and the dashboard's
     // Saved list dropped such a save without a word. One id per deal, for a reader who saved both.
@@ -151,9 +153,12 @@ export async function GET() {
   // not over (app/billing-controls.ts). A different question from `billing`, which is who pays right
   // now. A paused subscription pays nothing and is still there to resume, and somebody paying Apple
   // as well is billed to Apple and still needs a way to cancel the web one. The id stays here.
-  const { stripe_subscription_id: subscriptionId, ...shown } = profile;
+  const { stripe_subscription_id: subscriptionId, referred_by: referredBy, ...shown } = profile;
   const web_subscription = stripeOwnsStatus({ subscriptionId, status: profile.plan_status, pastDueSince: profile.past_due_since, pausedUntil: profile.paused_until });
-  return Response.json({ profile:{ ...shown, billing, web_subscription },favorites:favs.results.map((row) => row.deal_id),savedDeals:savedDeals.results.map(({ live, ...deal }) => ({ ...deal, live:!!live })),locations:locations.results,savedRestaurants:savedRestaurants.results,excludedRestaurants:excludedRestaurants.results,notificationPreferences:preferences.results,consent:consent || { status:"none" },deliveries:deliveries.results.map((row) => ({
+  // The reader's own referral code, and whether they can still add one (app/referral-code.ts).
+  // The creator's handle is the only thing shown: it is what the reader typed or clicked through.
+  const referral = { code: referredBy, can_add: !referredBy && referralWindowOpen(profile.created_at), window_ends_at: referralWindowEndsAt(profile.created_at)?.toISOString() ?? null };
+  return Response.json({ profile:{ ...shown, billing, web_subscription, referral },favorites:favs.results.map((row) => row.deal_id),savedDeals:savedDeals.results.map(({ live, ...deal }) => ({ ...deal, live:!!live })),locations:locations.results,savedRestaurants:savedRestaurants.results,excludedRestaurants:excludedRestaurants.results,notificationPreferences:preferences.results,consent:consent || { status:"none" },deliveries:deliveries.results.map((row) => ({
     id:row.id,
     status:row.status,
     sent_at:row.sent_at,
@@ -369,6 +374,26 @@ export async function POST(request: Request) {
     // actual boundary.
     const accentColor = isAccentKey(body.accentColor) && !(ACCENTS[body.accentColor].pro && !isPro(user)) ? body.accentColor : "coral";
     await env.DB.prepare("UPDATE users SET theme=?,accent_color=? WHERE id=?").bind(theme,accentColor,user.userId).run();
+  } else if (body.action === "referral_code") {
+    // Adding a referral code after sign-up. Every rule is decided here, not on the page: one code
+    // per account, only within the window, never changed or removed by the reader once set.
+    if (!(await rateLimit(`referral-code-user:${user.userId}`,10,60))) return apiError(429,"RATE_LIMITED","Too many attempts. Try again later.");
+    const account = await env.DB.prepare("SELECT referred_by,created_at FROM users WHERE id=?").bind(user.userId).first<{ referred_by: string | null; created_at: string }>();
+    if (!account) return apiError(404,"PROFILE_NOT_FOUND","Your profile could not be loaded.");
+    if (account.referred_by) return apiError(409,"REFERRAL_LOCKED","This account already has a referral code, and it cannot be changed.");
+    if (!referralWindowOpen(account.created_at)) return apiError(409,"REFERRAL_WINDOW_CLOSED",`Referral codes can only be added in the first ${REFERRAL_WINDOW_DAYS} days after creating an account.`);
+    const lookup = await resolveReferralCode(body.code,user.userId);
+    if (!lookup.ok) return lookup.reason === "self"
+      ? apiError(422,"REFERRAL_SELF","You can't use your own referral code.",{code:"Your own code"})
+      : apiError(404,"REFERRAL_CODE_NOT_FOUND","That referral code was not found.",{code:"Not found"});
+    // The conditions are repeated in the write itself, so two tabs racing each other (or the
+    // window closing between the read and the write) cannot set a second code over the first.
+    const written = await env.DB.prepare("UPDATE users SET referred_by=?,referred_campaign=NULL WHERE id=? AND referred_by IS NULL AND datetime(created_at)>datetime('now',?)")
+      .bind(lookup.handle,user.userId,`-${REFERRAL_WINDOW_DAYS} days`).run();
+    if (!written.meta.changes) return apiError(409,"REFERRAL_LOCKED","This account already has a referral code, and it cannot be changed.");
+    await env.DB.prepare("INSERT INTO audit_log(actor_id,actor_role,action,target_type,target_id,details) VALUES(?,?,'referral_code_set','user',?,?)")
+      .bind(user.userId,user.role,user.userId,JSON.stringify({handle:lookup.handle,source:"dashboard"})).run();
+    return Response.json({ ok:true,code:lookup.handle });
   } else if (body.action === "exclude_restaurant") {
     const restaurantId = cleanText(body.restaurantId,140);
     if (!restaurantId) return apiError(422,"RESTAURANT_REQUIRED","Choose a restaurant to exclude.");

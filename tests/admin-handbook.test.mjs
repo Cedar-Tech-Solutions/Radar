@@ -395,7 +395,7 @@ test("rejecting a suggestion is described with the reasons the server accepts", 
 
 test("the owner-approval article covers every action that waits for an owner", () => {
   const text = searchTextFor(articles.find((entry) => entry.id === "owner-approvals"));
-  const phrase = { bulk_lifecycle: "a whole market", delete_sponsorship: "deleting a sponsorship", affiliate_payout: "paying an affiliate", setting: "operator switch" };
+  const phrase = { bulk_lifecycle: "a whole market", delete_sponsorship: "deleting a sponsorship", affiliate_payout: "paying an affiliate", referral_correction: "correcting the referral code", setting: "operator switch" };
   assert.deepEqual([...OWNER_APPROVAL_ACTIONS].sort(), Object.keys(phrase).sort());
   for (const action of OWNER_APPROVAL_ACTIONS) assert.ok(text.includes(phrase[action]), `owner approvals should mention ${action}`);
   assert.match(adminRoute, /\(pending\?\.n \|\| 0\) >= 20/);

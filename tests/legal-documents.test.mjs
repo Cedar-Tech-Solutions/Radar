@@ -92,7 +92,12 @@ test("creator referral cookies honour Global Privacy Control", async () => {
   assert.equal((link.match(/max-age=\$\{THIRTY_DAYS\}/g) ?? []).length, 2, "the cookies are set in one place only");
   // And the sign-up that reads them ignores them on a request carrying Sec-GPC.
   const auth = code(await read("../app/auth.ts"));
-  assert.match(auth, /async function referringCreator\([^)]*\) \{\s*if \(\(await headers\(\)\)\.get\("sec-gpc"\) === "1"\) return \{ handle: null, campaign: null \};/);
+  // A code the reader typed themselves is read first (their own choice, not a parked cookie);
+  // every link cookie is read only after the GPC check.
+  const referring = auth.slice(auth.indexOf("async function referringCreator"), auth.indexOf("async function mappedProfile"));
+  assert.match(referring, /if \(\(await headers\(\)\)\.get\("sec-gpc"\) === "1"\) return \{ handle: null, campaign: null, source: null \};/);
+  assert.ok(referring.indexOf('"sec-gpc"') < referring.indexOf('"radar_creator"'), "the link cookie must be read after the GPC check");
+  assert.ok(referring.indexOf('"sec-gpc"') < referring.indexOf('"radar_creator_campaign"'));
   const privacy = code(await read("../app/[locale]/privacy/page.tsx"));
   assert.match(privacy, /If your browser\s+sends Global Privacy Control, they are not set/);
 });

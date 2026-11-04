@@ -243,7 +243,11 @@
       "INVALID_OFFER": "Cette option n’est pas disponible. Recommencez depuis le formulaire d’annulation.",
       "OFFER_NOT_OPEN": "Cette proposition n’est plus disponible. Recommencez depuis le formulaire d’annulation.",
       "INVALID_STEP": "Un problème est survenu. Rechargez la page et réessayez.",
-      "AREA_LIMIT_ACTIVE": "Le forfait gratuit garde un seul secteur actif. Mettez d’abord votre autre secteur en pause, ou passez à Radar Pro."
+      "AREA_LIMIT_ACTIVE": "Le forfait gratuit garde un seul secteur actif. Mettez d’abord votre autre secteur en pause, ou passez à Radar Pro.",
+      "REFERRAL_CODE_NOT_FOUND": "Ce code de parrainage est introuvable. Vérifiez l’orthographe et réessayez.",
+      "REFERRAL_LOCKED": "Ce compte a déjà un code de parrainage, et il ne peut pas être modifié.",
+      "REFERRAL_WINDOW_CLOSED": "Un code de parrainage ne peut être ajouté que dans les 7 jours suivant la création du compte.",
+      "REFERRAL_SELF": "Vous ne pouvez pas utiliser votre propre code de parrainage."
     },
     "fields": {
       "required": "Obligatoire",
@@ -266,7 +270,16 @@
     "signUpKicker": "Créer un compte",
     "signUpHeading": "Trouvez plus de bonnes offres à proximité",
     "signUpSubtitle": "Enregistrez vos endroits préférés et choisissez quand recevoir des alertes d’offres.",
-    "legal": "En continuant, vous acceptez les <terms>modalités</terms> de Radar et reconnaissez avoir pris connaissance de la <privacy>politique de confidentialité</privacy>."
+    "legal": "En continuant, vous acceptez les <terms>modalités</terms> de Radar et reconnaissez avoir pris connaissance de la <privacy>politique de confidentialité</privacy>.",
+    "referralLabel": "Code de parrainage (facultatif)",
+    "referralHint": "Un créateur vous a donné un code? Ajoutez-le maintenant. Il ne pourra pas être modifié plus tard.",
+    "referralPlaceholder": "p. ex. maya",
+    "referralApply": "Appliquer",
+    "referralChecking": "Vérification…",
+    "referralApplied": "Le code {code} sera ajouté à votre nouveau compte.",
+    "referralRemove": "Retirer",
+    "referralNotFound": "Ce code de parrainage est introuvable. Vérifiez l’orthographe et réessayez.",
+    "referralFailed": "Le code n’a pas pu être vérifié pour le moment. Vous pouvez aussi l’ajouter depuis votre tableau de bord dans les 7 jours."
   },
   "confirmEmail": {
     "pageTitle": "Confirmer le consentement courriel — Radar",
@@ -740,7 +753,17 @@
       "trialNote": "Gratuit pendant {days} jours, puis le tarif du forfait. Annulez avant la fin et rien ne vous est facturé.",
       "timezoneHint": "Les résumés d’alertes arrivent à l’heure choisie dans ce fuseau horaire.",
       "signInHeading": "Connexion et sécurité",
-      "planLink": "Forfait et facturation"
+      "planLink": "Forfait et facturation",
+      "referralHeading": "Code de parrainage",
+      "referralIntro": "Si un créateur vous a fait découvrir Radar, ajoutez son code pour le créditer. Chaque compte peut avoir un seul code, et une fois ajouté, il ne peut être ni modifié ni retiré.",
+      "referralLabel": "Code de parrainage",
+      "referralPlaceholder": "p. ex. maya",
+      "referralAdd": "Ajouter le code",
+      "referralDeadline": "Vous pouvez ajouter un code jusqu’au {date}.",
+      "referralConfirm": "Ajouter {code} comme code de parrainage? Il ne pourra être ni modifié ni retiré plus tard.",
+      "referralAdded": "Code de parrainage ajouté.",
+      "referralCurrent": "Votre code de parrainage",
+      "referralLocked": "Un code de parrainage est permanent une fois ajouté. Contactez le soutien s’il a été ajouté par erreur."
     },
     "footer": {
       "controls": "Contrôles du compte Radar",

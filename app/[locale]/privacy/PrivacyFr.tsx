@@ -252,7 +252,17 @@ export default function PrivacyFr() {
         et un compte existant n’est jamais réattribué. Le créateur voit combien de personnes se sont
         inscrites et abonnées par ses liens et ce qu’il a gagné, mais jamais votre nom ni votre
         adresse courriel. Si votre navigateur envoie le signal Global Privacy Control, aucun
-        parrainage n’est enregistré.
+        parrainage n’est enregistré à partir d’un lien.
+      </p>
+      <p>
+        <strong>Codes de parrainage.</strong> Vous pouvez aussi saisir vous-même le code de
+        parrainage d’un créateur, sur la page d’inscription ou dans votre tableau de bord dans les 7
+        jours suivant la création de votre compte. Comme c’est vous qui choisissez de le saisir, il
+        est enregistré même si votre navigateur envoie le signal Global Privacy Control, et il est
+        utilisé exactement comme un parrainage par lien. Un compte a un seul parrainage et, une fois
+        inscrit, vous ne pouvez ni le modifier ni le retirer. Notre personnel peut corriger un
+        parrainage ajouté par erreur si vous le demandez&nbsp;; chaque correction exige
+        l’approbation d’un propriétaire et est conservée dans notre journal d’audit.
       </p>
 
       <h2 id="use">3. Utilisation des renseignements</h2>
@@ -345,7 +355,14 @@ export default function PrivacyFr() {
           vous ouvrez sont comptées dans les totaux du créateur sans être liées à vous. Un lien de
           créateur ultérieur les remplace. Si votre navigateur envoie le signal Global Privacy
           Control, ils ne sont pas déposés, ceux qui l’étaient déjà sont supprimés, et un compte créé
-          à partir de ce navigateur n’est attribué à aucun créateur.
+          à partir de ce navigateur n’est attribué à aucun créateur par un lien.
+        </li>
+        <li>
+          <strong>Le témoin de code de parrainage</strong>, <code>radar_referral_code</code>, déposé
+          seulement lorsque vous saisissez un code de parrainage sur la page d’inscription. Il
+          contient le pseudonyme du créateur pendant au plus 7 jours afin de l’inscrire dans votre
+          compte à sa création, et il est supprimé si vous retirez le code. Les scripts de la page ne
+          peuvent pas le lire.
         </li>
         <li>
           <strong>Le stockage local sur votre appareil</strong> pour votre thème et votre couleur

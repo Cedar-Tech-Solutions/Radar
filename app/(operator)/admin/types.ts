@@ -78,6 +78,8 @@ export interface AdminUser {
   timezone?: string | null;
   country?: string | null;
   created_at?: string;
+  /** The creator handle this account is credited to (a link or a typed referral code), if any. */
+  referred_by?: string | null;
   /** The pinned owner, whose role nobody can change. Computed by /api/admin; see isProtectedOwner in app/auth.ts. */
   isProtected?: boolean;
 }
