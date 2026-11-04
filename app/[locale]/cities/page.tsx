@@ -9,7 +9,8 @@ import ChromeLink from "../../ChromeLink";
 import PublicPage from "../../PublicPage";
 import { getSiteOrigin, pageMetadata } from "../../siteMetadata";
 import { dealPageTitle } from "../../deal-meta";
-import { CityLinks, guidesIndexJson } from "./CityGuide";
+import { guidesIndexJson } from "./CityGuide";
+import CityFinder from "./CityFinder";
 
 export const dynamic = "force-dynamic";
 
@@ -35,16 +36,16 @@ export default async function CityGuides({ params }: { params: Promise<{ locale:
   if (!cities.length) notFound();
   const origin = (await getSiteOrigin()).origin;
   return (
-    <PublicPage className="legal city-page">
+    <PublicPage className="legal city-page city-index">
       <article lang="en">
         <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: guidesIndexJson(origin, cities) }} />
         <span className="kicker">CITY GUIDES</span>
         <h1>Happy hours and food deals by city</h1>
         <p className="lead">
-          A guide for every city where Radar lists deals at enough restaurants to be worth one. Each lists every
-          deal with the days and hours it runs, and the date it was last checked against the restaurant&rsquo;s own page.
+          {cities.length} city guides, by province and state. Each lists every deal in its city with the days and
+          hours it runs, and the date it was last checked against the restaurant&rsquo;s own page.
         </p>
-        <CityLinks cities={cities} />
+        <CityFinder cities={cities} />
         <p>
           Not seeing your city? <ChromeLink href="/">Search any city or postal code</ChromeLink> on the map, or{" "}
           <ChromeLink href="/?suggest=1">suggest a deal</ChromeLink> for it.

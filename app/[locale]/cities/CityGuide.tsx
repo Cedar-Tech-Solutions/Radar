@@ -53,7 +53,7 @@ export function TopicLinks({ city, topics, current }: { city: Pick<GuideCity, "s
   );
 }
 
-/** The other guides, for a reader who landed on the wrong city. */
+/** Other guides as chips: a city page's nearby guides (app/city-groups.ts relatedGuides), or a topic page's. */
 export function CityLinks({ cities, current }: { cities: readonly GuideCity[]; current?: string }) {
   const others = cities.filter((city) => city.slug !== current);
   if (!others.length) return null;

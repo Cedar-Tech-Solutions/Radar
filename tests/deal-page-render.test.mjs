@@ -451,6 +451,17 @@ test("the city guides render as real pages, and the old Ottawa addresses lead to
   assert.equal(index.status, 200);
   assert.match(index.html, /href="\/en\/cities\/ottawa-on"/);
   assert.match(head(index.html), /<link rel="canonical" href="https:\/\/radar\.cheap\/en\/cities"/);
+  // The index is grouped by country and province in the server HTML, with the search box beside it;
+  // the script only narrows what is already there (app/[locale]/cities/CityFinder.tsx).
+  const flat = index.html.replace(/<!-- -->/g, "");
+  assert.match(flat, /<h2[^>]*>Canada/);
+  assert.match(flat, /<h3>Ontario<\/h3>/);
+  assert.match(flat, /<input type="search"/);
+  assert.match(flat, /aria-pressed="true"[^>]*>All</);
+  assert.match(flat, /<h2[^>]*>Most deals<\/h2>/);
+  const indexGraph = [...index.html.matchAll(/<script type="application\/ld\+json">(\{"@context":"https:\/\/schema\.org","@graph"[^<]*)<\/script>/g)].flatMap((match) => JSON.parse(match[1])["@graph"]);
+  const guideCount = indexGraph.find((node) => node["@type"] === "ItemList").numberOfItems;
+  assert.equal((flat.match(/class="city-finder-name"/g) || []).length, guideCount, "every guide in the list is a server-rendered link");
 
   const hub = await render("/en/cities/ottawa-on");
   assert.equal(hub.status, 200);
@@ -458,6 +469,9 @@ test("the city guides render as real pages, and the old Ottawa addresses lead to
   assert.match(hub.html.replace(/<!-- -->/g, ""), /<h1>Ottawa happy hours and food deals<\/h1>/);
   assert.match(hub.html, /href="\/en\/cities\/ottawa-on\/happy-hour"/);
   assert.match(hub.html, /href="\/en\/deals\/kelseys-bank-happy"/);
+  assert.match(hub.html.replace(/<!-- -->/g, ""), /<h2>Nearby city guides<\/h2>/);
+  assert.match(hub.html.replace(/<!-- -->/g, ""), /href="\/en\/cities">All \d+ city guides/, "the hub links the index instead of listing every other guide");
+  assert.ok((hub.html.match(/href="\/en\/cities\/[a-z0-9-]+"/g) || []).length <= 13, "at most twelve other guides and itself");
   const graphs = [...hub.html.matchAll(/<script type="application\/ld\+json">(\{"@context":"https:\/\/schema\.org","@graph"[^<]*)<\/script>/g)].flatMap((match) => JSON.parse(match[1])["@graph"]);
   const crumbs = graphs.find((node) => node["@type"] === "BreadcrumbList").itemListElement;
   assert.deepEqual(crumbs.map((crumb) => crumb.item), ["https://radar.cheap/en", "https://radar.cheap/en/cities", "https://radar.cheap/en/cities/ottawa-on"]);

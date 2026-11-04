@@ -5,6 +5,7 @@ import { notFound, permanentRedirect } from "next/navigation";
 import { setRequestLocale } from "next-intl/server";
 import { englishOnlyAlternates } from "../../../alternates";
 import { GUIDES_PATH, cityDeals, cityHomeQuery, cityPath, guideCities, lastChecked, publishedTopics, restaurantCount } from "../../../city-pages";
+import { relatedGuides } from "../../../city-groups";
 import ChromeLink from "../../../ChromeLink";
 import PublicPage from "../../../PublicPage";
 import { getSiteOrigin, pageMetadata } from "../../../siteMetadata";
@@ -12,6 +13,9 @@ import { dealPageTitle } from "../../../deal-meta";
 import { CityLinks, DealList, TopicLinks, cityLabel, itemListJson } from "../CityGuide";
 
 export const dynamic = "force-dynamic";
+
+/** How many other guides a city page points to: its province or state first, then the deepest in its country. */
+const RELATED_GUIDES = 12;
 
 const load = cache(async (slug: string) => {
   const cities = await guideCities(env.DB);
@@ -45,6 +49,7 @@ export default async function CityGuidePage({ params }: { params: Promise<{ loca
   const origin = (await getSiteOrigin()).origin;
   const happyHours = deals.filter((deal) => deal.category === "Happy hour");
   const date = lastChecked(deals);
+  const related = relatedGuides(cities, city, RELATED_GUIDES);
   return (
     <PublicPage className="legal city-page">
       <article lang="en">
@@ -71,9 +76,12 @@ export default async function CityGuidePage({ params }: { params: Promise<{ loca
         <h2>Every {city.name} deal</h2>
         <DealList city={city} deals={deals} />
 
-        {cities.length > 1 && <>
-          <h2>Other city guides</h2>
-          <CityLinks cities={cities} current={city.slug} />
+        {related.length > 0 && <>
+          <h2>Nearby city guides</h2>
+          <CityLinks cities={related} />
+          <p>
+            <ChromeLink href="/cities">All {cities.length} city guides</ChromeLink>, by province and state.
+          </p>
         </>}
       </article>
     </PublicPage>

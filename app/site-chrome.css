@@ -578,6 +578,66 @@ main[tabindex="-1"]:focus { outline: none; }
 .city-page .city-deal-meta { color: var(--muted); font-size: 14px; }
 .city-page .city-deal-checked { color: var(--muted); font-size: 12px; letter-spacing: .02em; }
 
+/* The city guides' index (app/[locale]/cities/CityFinder.tsx): search and a country switch over
+   the cities grouped by province or state, wider than the legal column so the groups sit side by side. */
+.city-index article { max-width: 1040px; }
+.city-finder-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 12px 18px; margin: 26px 0 4px; }
+.city-finder-search { display: grid; gap: 6px; flex: 1 1 260px; max-width: 420px; }
+.city-finder-search span { font-size: 13px; font-weight: 700; color: var(--muted); letter-spacing: .02em; }
+.city-finder-search input {
+  width: 100%;
+  min-height: 46px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--field, #fff);
+  color: var(--ink);
+  font: inherit;
+  font-size: 16px;
+}
+.city-finder-search input::placeholder { color: var(--muted); }
+.city-finder-countries { display: flex; flex-wrap: wrap; gap: 8px; }
+.city-finder-countries button {
+  min-height: 44px;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--field, #fff);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.city-finder-countries button[aria-pressed="true"] { background: var(--coral-strong); border-color: var(--coral-strong); color: var(--on-coral); }
+.city-finder-count { font-weight: 500; color: var(--muted); font-size: .85em; }
+.city-finder-countries button[aria-pressed="true"] .city-finder-count,
+.city-page .city-finder-top .city-topics a .city-finder-count { color: inherit; opacity: .75; }
+.legal.city-index article p.city-finder-status { min-height: 1.4em; margin: 8px 0 0; font-size: 14px; }
+.city-finder-top { margin-top: 10px; }
+.legal.city-index h2 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-top: 34px; }
+.city-finder-regions { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 18px 28px; margin-top: 12px; }
+.city-finder-region h3 { font: 700 15px/1.3 var(--font-display), system-ui, sans-serif; margin: 0 0 4px; color: var(--ink); letter-spacing: .01em; }
+.legal.city-index article .city-finder-region ul { list-style: none; margin: 0; padding: 0; }
+.legal.city-index article .city-finder-region li { margin: 0; }
+.legal.city-index article .city-finder-region a {
+  display: grid;
+  gap: 1px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+  font-weight: 700;
+  text-decoration: none;
+  line-height: 1.35;
+}
+.legal.city-index article .city-finder-region a:hover .city-finder-name { color: var(--coral-strong); text-decoration: underline; }
+.city-finder-meta { color: var(--muted); font-size: 13px; font-weight: 500; }
+.legal.city-index article p.city-finder-empty { margin-top: 24px; }
+@media (max-width: 570px) {
+  .city-finder-regions { grid-template-columns: 1fr; gap: 14px; }
+  .city-finder-countries button { flex: 1 1 auto; }
+}
+
 /* The home page's link to the city guides, beside the city chips. */
 .city-links .city-guides-link { color: var(--coral-strong); font-weight: 700; border-bottom: 1px solid currentColor; padding: 7px 4px; text-decoration: none; }
 /* A chip that links to its city's guide looks like the chips that are buttons (enhancements.css). */
